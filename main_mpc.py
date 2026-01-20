@@ -630,7 +630,7 @@ def run_simulation(
         Q_terminal=500.0,
         zmp_margin=0.01,  # Larger margin for safety
         max_zmp_rate=1.0,  # Slower ZMP rate
-        slack_weight=1e6,
+        slack_weight=2e5,
         eps_abs=2e-4,
         eps_rel=2e-4,
         max_iter=400,
@@ -824,9 +824,6 @@ def run_simulation(
 
             actual_com_vel = sim.get_com_velocity()
             final_com_vel = actual_com_vel.copy()
-            k_end_vel = 0.2
-            com_target_x -= k_end_vel * actual_com_vel[0]
-            com_target_y -= k_end_vel * actual_com_vel[1]
             
             com_target = np.array([com_target_x, com_target_y, config.z_c])
             solve_times.append(0.0)
@@ -847,35 +844,22 @@ def run_simulation(
                 horizon, config.dt, walking_params, foot_params
             )
 
-            if state_machine.state in (WalkingState.SS_LEFT, WalkingState.SS_RIGHT):
-                shrink = 0.01
-            else:
-                shrink = 0.005
+            if state_machine.state in (WalkingState.DS, WalkingState.INIT, WalkingState.END):
+                ds_margin = 0.012
+                bounds_x = (bounds_x[0] - ds_margin, bounds_x[1] + ds_margin)
+                bounds_y = (bounds_y[0] - ds_margin, bounds_y[1] + ds_margin)
 
-            mpc_min_x = bounds_x[0] + shrink
-            mpc_max_x = bounds_x[1] - shrink
-            mpc_min_y = bounds_y[0] + shrink
-            mpc_max_y = bounds_y[1] - shrink
-
-            if np.any(mpc_min_x > mpc_max_x - 0.001):
-                mid = 0.5 * (bounds_x[0] + bounds_x[1])
-                mpc_min_x = np.minimum(mpc_min_x, mid - 0.0005)
-                mpc_max_x = np.maximum(mpc_max_x, mid + 0.0005)
-            if np.any(mpc_min_y > mpc_max_y - 0.001):
-                mid = 0.5 * (bounds_y[0] + bounds_y[1])
-                mpc_min_y = np.minimum(mpc_min_y, mid - 0.0005)
-                mpc_max_y = np.maximum(mpc_max_y, mid + 0.0005)
-
-            mpc_bounds_x = (mpc_min_x, mpc_max_x)
-            mpc_bounds_y = (mpc_min_y, mpc_max_y)
+            mpc_bounds_x = bounds_x
+            mpc_bounds_y = bounds_y
 
             actual_com = sim.get_com_position()
             actual_com_vel = sim.get_com_velocity()
             final_com_vel = actual_com_vel.copy()
             if state_machine.state in (WalkingState.SS_LEFT, WalkingState.SS_RIGHT, WalkingState.DS):
-                com_vel_x_history.append(actual_com_vel[0])
-                v_ref = config.stride_length / (walking_params.t_ss + walking_params.t_ds)
-                v_ref_history.append(v_ref)
+                if t > walking_params.t_init + 0.5:
+                    com_vel_x_history.append(actual_com_vel[0])
+                    v_ref = config.stride_length / (walking_params.t_ss + walking_params.t_ds)
+                    v_ref_history.append(v_ref)
             
             dcm_current = mpc.compute_dcm(actual_com, actual_com_vel)
             
