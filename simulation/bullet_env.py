@@ -268,6 +268,24 @@ class BulletSimulator:
             
         return vel_sum / m_total
 
+    def get_total_mass(self) -> float:
+        """Get total mass of base and all links."""
+        m_total = pb.getDynamicsInfo(self.robot_id, -1)[0]
+        for link_idx in range(pb.getNumJoints(self.robot_id)):
+            m_total += pb.getDynamicsInfo(self.robot_id, link_idx)[0]
+        return float(m_total)
+
+    def get_joint_torques_velocities(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Get motor torques and joint velocities for actuated joints."""
+        joint_ids = list(self.pos_map.keys())
+        torques = np.zeros(len(joint_ids))
+        velocities = np.zeros(len(joint_ids))
+        for i, jid in enumerate(joint_ids):
+            state = pb.getJointState(self.robot_id, jid)
+            velocities[i] = state[1]
+            torques[i] = state[3]
+        return torques, velocities
+
     def get_zmp_position(self) -> Optional[np.ndarray]:
         """Estimate ZMP from contact forces.
         

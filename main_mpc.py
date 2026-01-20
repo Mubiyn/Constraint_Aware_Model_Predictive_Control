@@ -56,6 +56,7 @@ class SimulationConfig:
     disturbance_force: float = 0.0
     disturbance_time: float = 5.0
     disturbance_duration: float = 0.1
+    track_energy: bool = False
 
 
 @dataclass
@@ -68,6 +69,13 @@ class SimulationMetrics:
     max_dcm_error: float
     avg_solve_ms: float
     max_solve_ms: float
+    distance_m: float
+    avg_speed_mps: float
+    avg_forward_vel_mps: float
+    forward_vel_mae_mps: float
+    final_com_vel: np.ndarray
+    energy_j: float
+    cot: float
 
 
 @dataclass
@@ -620,8 +628,13 @@ def run_simulation(
         Q_dcm=50.0,
         R_zmp=5e-3,  # Smoother ZMP commands
         Q_terminal=500.0,
-        zmp_margin=0.015,  # Larger margin for safety
-        max_zmp_rate=1.0  # Slower ZMP rate
+        zmp_margin=0.01,  # Larger margin for safety
+        max_zmp_rate=1.0,  # Slower ZMP rate
+        slack_weight=1e6,
+        eps_abs=2e-4,
+        eps_rel=2e-4,
+        max_iter=400,
+        polish=False,
     )
     
     mpc = DecoupledMPCController(mpc_params)
@@ -697,6 +710,12 @@ def run_simulation(
     zmp_history = []
     dcm_tracking_errors = []
     fell = False
+    com_vel_x_history = []
+    v_ref_history = []
+    initial_com = sim.get_com_position()
+    final_com_vel = np.zeros(3)
+    total_energy = 0.0
+    total_mass = sim.get_total_mass() if config.track_energy else 0.0
 
     observation_spec = ObservationSpec.default()
     dataset_collector = None
@@ -802,6 +821,12 @@ def run_simulation(
             
             com_target_x = end_com_start[0] + progress_smooth * (mid_x - end_com_start[0])
             com_target_y = end_com_start[1] + progress_smooth * (mid_y - end_com_start[1])
+
+            actual_com_vel = sim.get_com_velocity()
+            final_com_vel = actual_com_vel.copy()
+            k_end_vel = 0.2
+            com_target_x -= k_end_vel * actual_com_vel[0]
+            com_target_y -= k_end_vel * actual_com_vel[1]
             
             com_target = np.array([com_target_x, com_target_y, config.z_c])
             solve_times.append(0.0)
@@ -821,9 +846,36 @@ def run_simulation(
                 t, state_machine, current_lf.translation, current_rf.translation,
                 horizon, config.dt, walking_params, foot_params
             )
-            
+
+            if state_machine.state in (WalkingState.SS_LEFT, WalkingState.SS_RIGHT):
+                shrink = 0.01
+            else:
+                shrink = 0.005
+
+            mpc_min_x = bounds_x[0] + shrink
+            mpc_max_x = bounds_x[1] - shrink
+            mpc_min_y = bounds_y[0] + shrink
+            mpc_max_y = bounds_y[1] - shrink
+
+            if np.any(mpc_min_x > mpc_max_x - 0.001):
+                mid = 0.5 * (bounds_x[0] + bounds_x[1])
+                mpc_min_x = np.minimum(mpc_min_x, mid - 0.0005)
+                mpc_max_x = np.maximum(mpc_max_x, mid + 0.0005)
+            if np.any(mpc_min_y > mpc_max_y - 0.001):
+                mid = 0.5 * (bounds_y[0] + bounds_y[1])
+                mpc_min_y = np.minimum(mpc_min_y, mid - 0.0005)
+                mpc_max_y = np.maximum(mpc_max_y, mid + 0.0005)
+
+            mpc_bounds_x = (mpc_min_x, mpc_max_x)
+            mpc_bounds_y = (mpc_min_y, mpc_max_y)
+
             actual_com = sim.get_com_position()
             actual_com_vel = sim.get_com_velocity()
+            final_com_vel = actual_com_vel.copy()
+            if state_machine.state in (WalkingState.SS_LEFT, WalkingState.SS_RIGHT, WalkingState.DS):
+                com_vel_x_history.append(actual_com_vel[0])
+                v_ref = config.stride_length / (walking_params.t_ss + walking_params.t_ds)
+                v_ref_history.append(v_ref)
             
             dcm_current = mpc.compute_dcm(actual_com, actual_com_vel)
             
@@ -833,7 +885,7 @@ def run_simulation(
                     actual_com,
                     actual_com_vel,
                     dcm_ref_x, dcm_ref_y,
-                    bounds_x, bounds_y
+                    mpc_bounds_x, mpc_bounds_y
                 )
                 solve_time = time.time() - start_time
                 solve_times.append(solve_time * 1000)
@@ -946,7 +998,7 @@ def run_simulation(
             drift_correction = -k_drift * y_drift - k_integral * y_drift_integral + feedforward_offset
             correction_y += drift_correction
             
-            # Blend between ZMP ref and DCM-corrected position
+            # Track ZMP reference while using MPC for stabilization
             com_target_x = zmp_ref_x[0] + correction_x
             com_target_y = zmp_ref_y[0] + correction_y
             
@@ -1064,6 +1116,11 @@ def run_simulation(
                     print(f"\n*** APPLYING {config.disturbance_force}N LATERAL PUSH at t={t:.2f}s (state={state_str}) ***\n")
         
         sim.step()
+
+        if config.track_energy:
+            torques, velocities = sim.get_joint_torques_velocities()
+            step_power = float(np.sum(np.abs(torques * velocities)))
+            total_energy += step_power * config.dt
         
         if gui:
             sim.update_camera(com_target)
@@ -1166,6 +1223,14 @@ def run_simulation(
     sim.close()
 
     if return_metrics:
+        distance = float(final_com[0] - initial_com[0])
+        avg_speed = distance / max(t, 1e-6)
+        if com_vel_x_history:
+            avg_forward_vel = float(np.mean(com_vel_x_history))
+            vel_mae = float(np.mean(np.abs(np.array(com_vel_x_history) - np.array(v_ref_history))))
+        else:
+            avg_forward_vel = 0.0
+            vel_mae = 0.0
         if len(zmp_violations) > 0:
             n_violations = sum(1 for v in zmp_violations if v > 0.001)
             compliance_rate = 1.0 - n_violations / len(zmp_violations)
@@ -1184,6 +1249,11 @@ def run_simulation(
         avg_solve = float(np.mean(solve_times)) if solve_times else 0.0
         max_solve = float(np.max(solve_times)) if solve_times else 0.0
 
+        if distance > 0.0 and total_mass > 0.0:
+            cot = total_energy / (total_mass * 9.81 * distance)
+        else:
+            cot = 0.0
+
         return SimulationMetrics(
             duration=t,
             fell=fell,
@@ -1193,6 +1263,13 @@ def run_simulation(
             max_dcm_error=max_dcm_err,
             avg_solve_ms=avg_solve,
             max_solve_ms=max_solve,
+            distance_m=distance,
+            avg_speed_mps=avg_speed,
+            avg_forward_vel_mps=avg_forward_vel,
+            forward_vel_mae_mps=vel_mae,
+            final_com_vel=final_com_vel,
+            energy_j=total_energy,
+            cot=cot,
         )
 
     return None
@@ -1225,10 +1302,91 @@ def validate_mpc(
     print(f"ZMP compliance: {metrics.zmp_compliance:.3f} (min {thresholds.min_zmp_compliance:.3f})")
     print(f"Avg DCM error: {metrics.avg_dcm_error:.4f} (max {thresholds.max_avg_dcm_error:.4f})")
     print(f"Fell: {metrics.fell}")
+    print(f"Distance: {metrics.distance_m:.3f} m | Avg speed: {metrics.avg_speed_mps:.3f} m/s")
 
     passed = zmp_ok and dcm_ok and fall_ok
     print(f"Validation result: {'PASS' if passed else 'FAIL'}")
     return passed
+
+
+def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
+    print("\nRunning ATP test suite...")
+    print("=" * 60)
+
+    results = {}
+
+    # Test 1: Steady-State Walking (approx 10m)
+    required_steps = int(np.ceil(10.0 / base_config.stride_length)) + 2
+    config_t1 = SimulationConfig(**{**base_config.__dict__, "n_steps": required_steps})
+    metrics_t1 = run_simulation(config_t1, gui=gui, print_every=200, return_metrics=True)
+    results["steady_state"] = {
+        "distance_m": metrics_t1.distance_m,
+        "fell": metrics_t1.fell,
+    }
+
+    # Test 2: ZMP Boundary Test
+    config_t2 = SimulationConfig(**base_config.__dict__)
+    metrics_t2 = run_simulation(config_t2, gui=gui, print_every=200, return_metrics=True)
+    results["zmp_boundary"] = {
+        "compliance": metrics_t2.zmp_compliance,
+        "max_violation": metrics_t2.max_zmp_violation,
+    }
+
+    # Test 3: External Perturbation
+    config_t3 = SimulationConfig(**{**base_config.__dict__, "disturbance_force": 40.0})
+    metrics_t3 = run_simulation(config_t3, gui=gui, print_every=200, return_metrics=True)
+    results["disturbance"] = {
+        "fell": metrics_t3.fell,
+        "force": 40.0,
+    }
+
+    # Test 4: Velocity Tracking
+    config_t4 = SimulationConfig(**{**base_config.__dict__, "t_ss": 1.1, "t_ds": 1.6})
+    metrics_t4 = run_simulation(config_t4, gui=gui, print_every=200, return_metrics=True)
+    results["velocity_tracking"] = {
+        "forward_vel_mae": metrics_t4.forward_vel_mae_mps,
+        "avg_forward_vel": metrics_t4.avg_forward_vel_mps,
+    }
+
+    # Test 6: Stop-and-Go
+    config_t6 = SimulationConfig(**{**base_config.__dict__, "t_end": 3.0})
+    metrics_t6 = run_simulation(config_t6, gui=gui, print_every=200, return_metrics=True)
+    results["stop_and_go"] = {
+        "final_com_vel": metrics_t6.final_com_vel,
+        "fell": metrics_t6.fell,
+    }
+
+    # Test 5: Energy Efficiency
+    config_t5_mpc = SimulationConfig(**{**base_config.__dict__, "track_energy": True})
+    config_t5_baseline = SimulationConfig(**{**base_config.__dict__, "track_energy": True, "use_mpc": False})
+    metrics_t5_mpc = run_simulation(config_t5_mpc, gui=gui, print_every=200, return_metrics=True)
+    metrics_t5_baseline = run_simulation(config_t5_baseline, gui=gui, print_every=200, return_metrics=True)
+
+    if metrics_t5_baseline.cot > 0.0:
+        cot_reduction = (metrics_t5_baseline.cot - metrics_t5_mpc.cot) / metrics_t5_baseline.cot
+    else:
+        cot_reduction = 0.0
+
+    results["energy_efficiency"] = {
+        "cot_mpc": metrics_t5_mpc.cot,
+        "cot_baseline": metrics_t5_baseline.cot,
+        "cot_reduction": cot_reduction,
+    }
+
+    print("\nATP Summary")
+    print("-" * 60)
+    print(f"Test 1 (10m walk): distance={results['steady_state']['distance_m']:.2f}m, fell={results['steady_state']['fell']}")
+    print(f"Test 2 (ZMP): compliance={results['zmp_boundary']['compliance']:.3f}, max_violation={results['zmp_boundary']['max_violation']:.4f}m")
+    print(f"Test 3 (Push 40N): fell={results['disturbance']['fell']}")
+    print(f"Test 4 (Velocity MAE): {results['velocity_tracking']['forward_vel_mae']:.4f} m/s, avg v={results['velocity_tracking']['avg_forward_vel']:.4f} m/s")
+    print(f"Test 6 (Stop-and-Go): final_com_vel={results['stop_and_go']['final_com_vel']}")
+    print(
+        "Test 5 (Energy Efficiency): "
+        f"CoT MPC={results['energy_efficiency']['cot_mpc']:.4f}, "
+        f"Baseline={results['energy_efficiency']['cot_baseline']:.4f}, "
+        f"Reduction={results['energy_efficiency']['cot_reduction'] * 100:.1f}%"
+    )
+    print("=" * 60)
 
 
 def main():
@@ -1243,6 +1401,7 @@ def main():
     parser.add_argument("--disturbance-time", type=float, default=5.0,
                         help="Time (s) to apply disturbance")
     parser.add_argument("--validate-mpc", action="store_true", help="Run MPC validation and exit")
+    parser.add_argument("--run-atp", action="store_true", help="Run ATP test suite and exit")
     parser.add_argument("--collect-bc", type=str, default=None, help="Path to save MPC rollout dataset (.npz)")
     parser.add_argument("--train-bc", type=str, default=None, help="Path to dataset (.npz) for training a linear policy")
     parser.add_argument("--bc-output", type=str, default="v2/rl/linear_policy.npz", help="Output path for trained policy")
@@ -1273,6 +1432,10 @@ def main():
 
     if args.validate_mpc:
         validate_mpc(config, MPCValidationThresholds(), gui=not args.no_gui)
+        return
+
+    if args.run_atp:
+        run_atp_tests(config, gui=not args.no_gui)
         return
 
     rl_config = None

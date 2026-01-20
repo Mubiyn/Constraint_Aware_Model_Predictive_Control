@@ -23,13 +23,13 @@ References:
 - Englsberger et al., "Three-Dimensional Bipedal Walking Control Based on DCM"
 - Kajita et al., "Biped Walking Pattern Generation by using Preview Control of ZMP"
 """
-from dataclasses import dataclass, field
-from typing import Tuple, List, Optional
+from dataclasses import dataclass
+from typing import Tuple, Optional
 import time
 
 import numpy as np
 from scipy import sparse
-from qpsolvers import solve_qp
+import osqp
 
 from v2.models.lipm import LIPM, LIPMParams
 
@@ -58,6 +58,11 @@ class MPCParams:
     Q_terminal: float = 1000.0
     zmp_margin: float = 0.005
     max_zmp_rate: float = 2.0
+    slack_weight: float = 1e4
+    eps_abs: float = 2e-4
+    eps_rel: float = 2e-4
+    max_iter: int = 400
+    polish: bool = False
 
 
 class MPCController:
@@ -82,6 +87,7 @@ class MPCController:
         self._setup_prediction_matrices()
         self._prev_solution: Optional[np.ndarray] = None
         self._prev_zmp: float = 0.0
+        self._solver: Optional[osqp.OSQP] = None
         
     def _setup_prediction_matrices(self):
         """Build DCM prediction matrices for the QP formulation."""
@@ -116,15 +122,63 @@ class MPCController:
         
         Q = p.Q_dcm * np.eye(N)
         Q[-1, -1] = p.Q_terminal
-        
+
         diff_mat = np.eye(N) - np.diag(np.ones(N - 1), -1)
         R = p.R_zmp * (diff_mat.T @ diff_mat)
-        
-        self.P_qp_base = self.Pu.T @ Q @ self.Pu + R
-        self.P_qp_base = (self.P_qp_base + self.P_qp_base.T) / 2.0 + 1e-6 * np.eye(N)
-        
+
+        P_dense = self.Pu.T @ Q @ self.Pu + R
+        P_dense = (P_dense + P_dense.T) / 2.0 + 1e-6 * np.eye(N)
+
+        self.P_qp_base = sparse.csc_matrix(P_dense)
         self.Q_dcm_mat = Q
         self.diff_mat = diff_mat
+        self.diff_sparse = sparse.csc_matrix(diff_mat)
+
+        slack_weight = self.params.slack_weight
+        P_slack = 2.0 * slack_weight * sparse.eye(N, format="csc")
+        self.P_qp = sparse.block_diag((self.P_qp_base, P_slack), format="csc")
+
+        I = sparse.eye(N, format="csc")
+        Z = sparse.csc_matrix((N, N))
+
+        A1 = sparse.hstack([I, -I], format="csc")
+        A2 = sparse.hstack([I, I], format="csc")
+        A3 = sparse.hstack([Z, I], format="csc")
+
+        blocks = [A1, A2, A3]
+        self._use_rate_constraints = self.params.max_zmp_rate < np.inf
+        if self._use_rate_constraints:
+            A4 = sparse.hstack([self.diff_sparse, Z], format="csc")
+            blocks.append(A4)
+
+        self.A_qp = sparse.vstack(blocks, format="csc")
+
+        self._setup_solver()
+
+    def _setup_solver(self):
+        N = self.params.horizon
+        n_vars = 2 * N
+        n_rows = self.A_qp.shape[0]
+        q_init = np.zeros(n_vars)
+        l_init = -np.inf * np.ones(n_rows)
+        u_init = np.inf * np.ones(n_rows)
+
+        solver = osqp.OSQP()
+        solver.setup(
+            P=self.P_qp,
+            q=q_init,
+            A=self.A_qp,
+            l=l_init,
+            u=u_init,
+            warm_start=True,
+            verbose=False,
+            eps_abs=self.params.eps_abs,
+            eps_rel=self.params.eps_rel,
+            max_iter=self.params.max_iter,
+            polish=self.params.polish,
+            adaptive_rho=True,
+        )
+        self._solver = solver
         
     def compute_control(
         self, 
@@ -174,60 +228,59 @@ class MPCController:
         if current_zmp is not None:
             q_qp[0] += p.R_zmp * (-current_zmp)
         
-        constraints = []
-        constraint_bounds = []
-        
-        constraints.append(np.eye(N))
-        constraint_bounds.append((zmp_min_constrained, zmp_max_constrained))
-        
-        if p.max_zmp_rate < np.inf and current_zmp is not None:
+        l_blocks = []
+        u_blocks = []
+
+        l1 = zmp_min_constrained
+        u1 = np.full(N, np.inf)
+        l2 = np.full(N, -np.inf)
+        u2 = zmp_max_constrained
+        l3 = np.zeros(N)
+        u3 = np.full(N, np.inf)
+
+        l_blocks.extend([l1, l2, l3])
+        u_blocks.extend([u1, u2, u3])
+
+        if self._use_rate_constraints:
             max_delta = p.max_zmp_rate * dt
-            
-            rate_lb = np.full(N, -max_delta)
-            rate_ub = np.full(N, max_delta)
-            rate_lb[0] = current_zmp - max_delta
-            rate_ub[0] = current_zmp + max_delta
-            
-            for i in range(1, N):
-                rate_lb[i] = -max_delta
-                rate_ub[i] = max_delta
-        
-        G_zmp = np.vstack([np.eye(N), -np.eye(N)])
-        h_zmp = np.concatenate([zmp_max_constrained, -zmp_min_constrained])
+            l4 = np.full(N, -max_delta)
+            u4 = np.full(N, max_delta)
+            ref_zmp = current_zmp if current_zmp is not None else self._prev_zmp
+            l4[0] = ref_zmp - max_delta
+            u4[0] = ref_zmp + max_delta
+            l_blocks.append(l4)
+            u_blocks.append(u4)
+
+        l_qp = np.concatenate(l_blocks)
+        u_qp = np.concatenate(u_blocks)
         
         start_time = time.time()
         
         try:
-            init_x = self._prev_solution if self._prev_solution is not None else None
-            
-            result = solve_qp(
-                P=self.P_qp_base.astype(np.float64), 
-                q=q_qp.astype(np.float64), 
-                G=G_zmp.astype(np.float64), 
-                h=h_zmp.astype(np.float64),
-                solver="osqp",
-                verbose=False,
-                eps_abs=1e-4,
-                eps_rel=1e-4,
-                max_iter=500,
-                polish=True,
-                warm_start=True,
-                initvals=init_x
-            )
+            if self._solver is None:
+                self._setup_solver()
+
+            q_qp_full = np.concatenate([q_qp, np.zeros(N)])
+            self._solver.update(q=q_qp_full, l=l_qp, u=u_qp)
+            if self._prev_solution is not None:
+                self._solver.warm_start(x=self._prev_solution)
+
+            result = self._solver.solve()
             
             solve_time = time.time() - start_time
             
-            if result is not None:
-                self._prev_solution = result
-                zmp_opt = result[0]
-                predicted_dcm = self.Pu @ result + b
+            if result.info.status in ("solved", "solved inaccurate"):
+                zmp_seq = result.x[:N]
+                self._prev_solution = result.x
+                zmp_opt = float(zmp_seq[0])
+                predicted_dcm = self.Pu @ zmp_seq + b
                 
                 info = {
                     'status': 'solved',
                     'optimal': True,
                     'solve_time': solve_time,
                     'predicted_dcm': predicted_dcm,
-                    'zmp_sequence': result,
+                    'zmp_sequence': zmp_seq,
                     'dcm_ref': dcm_ref,
                     'tracking_error': np.mean(np.abs(predicted_dcm - dcm_ref)),
                     'raw_zmp': zmp_opt
@@ -235,7 +288,7 @@ class MPCController:
             else:
                 zmp_opt = self._fallback_control(dcm, dcm_ref[0], zmp_min[0], zmp_max[0])
                 info = {
-                    'status': 'failed',
+                    'status': result.info.status,
                     'optimal': False,
                     'solve_time': solve_time,
                     'predicted_dcm': None,
