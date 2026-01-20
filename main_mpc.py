@@ -29,6 +29,10 @@ from v2.utils.foot import (
 from v2.utils.state_machine import WalkingState, WalkingParams, WalkingStateMachine
 from v2.utils.inverse_kinematic import IKParams, solve_inverse_kinematics
 from v2.simulation.bullet_env import BulletSimulator
+from v2.rl.dataset import DatasetCollector
+from v2.rl.policy import LinearPolicy
+from v2.rl.obs import ObservationSpec, build_observation
+from v2.rl.bc import fit_linear_policy
 
 
 @dataclass
@@ -52,6 +56,32 @@ class SimulationConfig:
     disturbance_force: float = 0.0
     disturbance_time: float = 5.0
     disturbance_duration: float = 0.1
+
+
+@dataclass
+class SimulationMetrics:
+    duration: float
+    fell: bool
+    zmp_compliance: float
+    max_zmp_violation: float
+    avg_dcm_error: float
+    max_dcm_error: float
+    avg_solve_ms: float
+    max_solve_ms: float
+
+
+@dataclass
+class MPCValidationThresholds:
+    min_zmp_compliance: float = 0.95
+    max_avg_dcm_error: float = 0.05
+
+
+@dataclass
+class RLConfig:
+    dataset_path: Optional[Path] = None
+    policy_path: Optional[Path] = None
+    policy_mode: str = "residual"  # "direct" or "residual"
+    residual_clip: float = 0.03
 
 
 def compute_zmp_reference(
@@ -435,7 +465,14 @@ def compute_base_from_foot(
     return oMb_new
 
 
-def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Optional[int] = None, print_every: int = 50):
+def run_simulation(
+    config: SimulationConfig,
+    gui: bool = True,
+    max_steps: Optional[int] = None,
+    print_every: int = 50,
+    rl_config: Optional[RLConfig] = None,
+    return_metrics: bool = False,
+):
     """Run the MPC walking simulation.
     
     Args:
@@ -659,6 +696,21 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
     zmp_violations = []
     zmp_history = []
     dcm_tracking_errors = []
+    fell = False
+
+    observation_spec = ObservationSpec.default()
+    dataset_collector = None
+    policy = None
+
+    if rl_config is not None:
+        if rl_config.dataset_path is not None:
+            dataset_collector = DatasetCollector(
+                obs_dim=observation_spec.dim,
+                action_dim=2,
+            )
+        if rl_config.policy_path is not None:
+            policy = LinearPolicy.load(rl_config.policy_path)
+
     state_violation_counts = {WalkingState.INIT: [0, 0], WalkingState.SS_LEFT: [0, 0], 
                               WalkingState.SS_RIGHT: [0, 0], WalkingState.DS: [0, 0], 
                               WalkingState.END: [0, 0]}
@@ -802,6 +854,47 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
                 ])
                 solve_times.append(0.0)
             
+            zmp_des_mpc = zmp_des.copy()
+
+            phase_progress = state_machine.get_phase_progress(t)
+            obs = build_observation(
+                com=actual_com,
+                com_vel=actual_com_vel,
+                dcm=dcm_current,
+                dcm_ref=np.array([dcm_ref_x[0], dcm_ref_y[0]]),
+                zmp_bounds_x=np.array([bounds_x[0][0], bounds_x[1][0]]),
+                zmp_bounds_y=np.array([bounds_y[0][0], bounds_y[1][0]]),
+                phase_progress=phase_progress,
+                state=state_machine.state,
+                spec=observation_spec,
+            )
+
+            if dataset_collector is not None:
+                dataset_collector.add(obs, zmp_des_mpc)
+
+            control_label = "MPC"
+
+            if policy is not None:
+                policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
+                if policy_action.shape[0] != 2:
+                    raise ValueError("Policy action must be 2D [zmp_x, zmp_y]")
+                if rl_config.policy_mode == "direct":
+                    zmp_des = policy_action
+                    control_label = "POLICY"
+                elif rl_config.policy_mode == "residual":
+                    residual = np.clip(
+                        policy_action,
+                        -rl_config.residual_clip,
+                        rl_config.residual_clip,
+                    )
+                    zmp_des = zmp_des + residual
+                    control_label = "RESIDUAL"
+                else:
+                    raise ValueError(f"Unknown policy_mode: {rl_config.policy_mode}")
+
+            zmp_des[0] = np.clip(zmp_des[0], bounds_x[0][0], bounds_x[1][0])
+            zmp_des[1] = np.clip(zmp_des[1], bounds_y[0][0], bounds_y[1][0])
+
             if state_changed:
                 print(f"  DCM Ctrl: dcm=[{dcm_current[0]:.3f}, {dcm_current[1]:.3f}]")
                 print(f"  DCM Ctrl: dcm_ref=[{dcm_ref_x[0]:.3f}, {dcm_ref_y[0]:.3f}]")
@@ -862,6 +955,7 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
             actual_zmp = sim.get_zmp_position()
             if actual_zmp is None:
                 print(f"\nWARNING: Lost contact at t={t:.2f}s - robot may have fallen!")
+                fell = True
                 break
             zmp_history.append(actual_zmp.copy())
             
@@ -975,7 +1069,7 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
             sim.update_camera(com_target)
         
         if mpc_used:
-            disp_info = f"MPC ZMP: [{zmp_des[0]:.3f}, {zmp_des[1]:.3f}]"
+            disp_info = f"ZMP: [{zmp_des[0]:.3f}, {zmp_des[1]:.3f}]"
         else:
             disp_info = f"Target CoM: [{com_target[0]:.3f}, {com_target[1]:.3f}]"
             
@@ -984,9 +1078,12 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
             zmp = sim.get_zmp_position()
             base_height = sim.get_base_height()
             
-            mpc_indicator = "[MPC]" if mpc_used else "[Direct]"
+            if mpc_used:
+                mode_tag = f"[{control_label}]"
+            else:
+                mode_tag = "[Direct]"
             print(
-                f"Step {step:5d} | t={t:.3f}s | {state_machine.state.name:10s} {mpc_indicator:8s} | "
+                f"Step {step:5d} | t={t:.3f}s | {state_machine.state.name:10s} {mode_tag:8s} | "
                 f"CoM: [{actual_com[0]:.3f}, {actual_com[1]:.3f}] | "
                 f"{disp_info} | "
                 f"H: {base_height:.3f}"
@@ -1003,6 +1100,7 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
         base_height = sim.get_base_height()
         if base_height < 0.5:
             print(f"\nRobot fell! Base height: {base_height:.3f}")
+            fell = True
             break
             
     print("-" * 60)
@@ -1061,7 +1159,76 @@ def run_simulation(config: SimulationConfig, gui: bool = True, max_steps: Option
     final_com = sim.get_com_position()
     print(f"Final CoM position: [{final_com[0]:.3f}, {final_com[1]:.3f}, {final_com[2]:.3f}]")
     
+    if dataset_collector is not None and rl_config is not None and rl_config.dataset_path is not None:
+        dataset_collector.save(rl_config.dataset_path)
+        print(f"Saved behavior cloning dataset to {rl_config.dataset_path}")
+
     sim.close()
+
+    if return_metrics:
+        if len(zmp_violations) > 0:
+            n_violations = sum(1 for v in zmp_violations if v > 0.001)
+            compliance_rate = 1.0 - n_violations / len(zmp_violations)
+            max_violation = max(zmp_violations)
+        else:
+            compliance_rate = 1.0
+            max_violation = 0.0
+
+        if len(dcm_tracking_errors) > 0:
+            avg_dcm_err = float(np.mean(dcm_tracking_errors))
+            max_dcm_err = float(max(dcm_tracking_errors))
+        else:
+            avg_dcm_err = 0.0
+            max_dcm_err = 0.0
+
+        avg_solve = float(np.mean(solve_times)) if solve_times else 0.0
+        max_solve = float(np.max(solve_times)) if solve_times else 0.0
+
+        return SimulationMetrics(
+            duration=t,
+            fell=fell,
+            zmp_compliance=compliance_rate,
+            max_zmp_violation=max_violation,
+            avg_dcm_error=avg_dcm_err,
+            max_dcm_error=max_dcm_err,
+            avg_solve_ms=avg_solve,
+            max_solve_ms=max_solve,
+        )
+
+    return None
+
+
+def validate_mpc(
+    config: SimulationConfig,
+    thresholds: MPCValidationThresholds,
+    gui: bool = False,
+) -> bool:
+    metrics = run_simulation(
+        config,
+        gui=gui,
+        max_steps=None,
+        print_every=200,
+        rl_config=None,
+        return_metrics=True,
+    )
+
+    if metrics is None:
+        print("No metrics returned.")
+        return False
+
+    zmp_ok = metrics.zmp_compliance >= thresholds.min_zmp_compliance
+    dcm_ok = metrics.avg_dcm_error <= thresholds.max_avg_dcm_error
+    fall_ok = not metrics.fell
+
+    print("\nMPC Validation Summary")
+    print("-" * 40)
+    print(f"ZMP compliance: {metrics.zmp_compliance:.3f} (min {thresholds.min_zmp_compliance:.3f})")
+    print(f"Avg DCM error: {metrics.avg_dcm_error:.4f} (max {thresholds.max_avg_dcm_error:.4f})")
+    print(f"Fell: {metrics.fell}")
+
+    passed = zmp_ok and dcm_ok and fall_ok
+    print(f"Validation result: {'PASS' if passed else 'FAIL'}")
+    return passed
 
 
 def main():
@@ -1075,6 +1242,19 @@ def main():
                         help="Apply lateral disturbance force (N) during single support")
     parser.add_argument("--disturbance-time", type=float, default=5.0,
                         help="Time (s) to apply disturbance")
+    parser.add_argument("--validate-mpc", action="store_true", help="Run MPC validation and exit")
+    parser.add_argument("--collect-bc", type=str, default=None, help="Path to save MPC rollout dataset (.npz)")
+    parser.add_argument("--train-bc", type=str, default=None, help="Path to dataset (.npz) for training a linear policy")
+    parser.add_argument("--bc-output", type=str, default="v2/rl/linear_policy.npz", help="Output path for trained policy")
+    parser.add_argument("--policy", type=str, default=None, help="Path to a trained linear policy (.npz)")
+    parser.add_argument(
+        "--policy-mode",
+        type=str,
+        default="residual",
+        choices=["direct", "residual"],
+        help="How to apply policy: direct ZMP or residual on MPC",
+    )
+    parser.add_argument("--residual-clip", type=float, default=0.03, help="Residual ZMP clip (m)")
     args = parser.parse_args()
     
     config = SimulationConfig(
@@ -1084,11 +1264,32 @@ def main():
         disturbance_time=args.disturbance_time
     )
     
+    if args.train_bc is not None:
+        dataset_path = Path(args.train_bc)
+        output_path = Path(args.bc_output)
+        fit_linear_policy(dataset_path, output_path)
+        print(f"Trained linear policy saved to {output_path}")
+        return
+
+    if args.validate_mpc:
+        validate_mpc(config, MPCValidationThresholds(), gui=not args.no_gui)
+        return
+
+    rl_config = None
+    if args.collect_bc is not None or args.policy is not None:
+        rl_config = RLConfig(
+            dataset_path=Path(args.collect_bc) if args.collect_bc is not None else None,
+            policy_path=Path(args.policy) if args.policy is not None else None,
+            policy_mode=args.policy_mode,
+            residual_clip=args.residual_clip,
+        )
+
     run_simulation(
-        config, 
+        config,
         gui=not args.no_gui,
         max_steps=args.max_steps,
-        print_every=args.print_every
+        print_every=args.print_every,
+        rl_config=rl_config,
     )
 
 
