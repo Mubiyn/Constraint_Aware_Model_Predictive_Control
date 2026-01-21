@@ -41,15 +41,34 @@ def _unflatten_policy(vec: np.ndarray, action_dim: int, obs_dim: int) -> Tuple[n
     return weights, bias
 
 
-def _score_metrics(metrics) -> float:
+def _score_metrics(metrics, policy_mode: str = "residual") -> float:
+    """Compute score from simulation metrics.
+    
+    For gait policies, emphasize speed while maintaining stability.
+    For other policies, emphasize compliance and tracking.
+    """
     score = 0.0
+    
     if metrics.fell:
         score -= 200.0
-    score += 120.0 * metrics.zmp_compliance
-    score -= 50.0 * metrics.max_zmp_violation
-    score -= 20.0 * metrics.forward_vel_mae_mps
-    score += 5.0 * metrics.distance_m
-    score -= 5.0 * metrics.avg_dcm_error
+        return float(score)  # Early exit for falls
+    
+    if policy_mode == "gait":
+        # Gait policy: prioritize speed with stability constraints
+        score += 50.0 * metrics.avg_speed_mps  # Primary objective: speed
+        score += 100.0 * metrics.zmp_compliance  # Maintain safety
+        score -= 100.0 * metrics.max_zmp_violation  # Heavy penalty for violations
+        score -= 20.0 * metrics.avg_dcm_error  # Stability
+        score -= 10.0 * metrics.forward_vel_mae_mps  # Smooth velocity
+        score -= 0.5 * metrics.cot  # Energy efficiency (minor)
+    else:
+        # Default policy: prioritize compliance and tracking
+        score += 120.0 * metrics.zmp_compliance
+        score -= 50.0 * metrics.max_zmp_violation
+        score -= 20.0 * metrics.forward_vel_mae_mps
+        score += 5.0 * metrics.distance_m
+        score -= 5.0 * metrics.avg_dcm_error
+    
     return float(score)
 
 
@@ -83,7 +102,7 @@ def _evaluate_policy(
     policy_path.unlink(missing_ok=True)
     if metrics is None:
         return -1e6
-    return _score_metrics(metrics)
+    return _score_metrics(metrics, policy_mode=policy_mode)
 
 
 def train_residual_cem(

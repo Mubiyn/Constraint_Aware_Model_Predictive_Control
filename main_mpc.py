@@ -89,9 +89,14 @@ class MPCValidationThresholds:
 class RLConfig:
     dataset_path: Optional[Path] = None
     policy_path: Optional[Path] = None
-    policy_mode: str = "residual"  # "direct" or "residual"
+    policy_mode: str = "residual"  # "direct", "residual", "weights", or "gait"
     residual_clip: float = 0.03
     weight_update_steps: int = 20
+    gait_update_steps: int = 10  # Steps between gait parameter updates
+    stride_range: Tuple[float, float] = (0.8, 1.5)  # Multiplier on base stride
+    ss_time_range: Tuple[float, float] = (0.6, 1.0)  # Multiplier on base t_ss
+    ds_time_range: Tuple[float, float] = (0.5, 1.0)  # Multiplier on base t_ds
+    margin_range: Tuple[float, float] = (0.5, 1.5)  # Multiplier on base margin
 
 
 def compute_zmp_reference(
@@ -646,6 +651,13 @@ def run_simulation(
     base_zmp_margin = mpc_params.zmp_margin
     weight_scales = np.array([1.0, 1.0, 1.0])
     
+    # Gait parameter tracking
+    base_stride = config.stride_length
+    base_t_ss = config.t_ss
+    base_t_ds = config.t_ds
+    base_margin = mpc_params.zmp_margin
+    gait_params = np.array([1.0, 1.0, 1.0, 1.0])  # stride, ss, ds, margin scales
+    
     lipm_params = LIPMParams(z_c=config.z_c, dt=config.dt)
     lipm = DecoupledLIPM(lipm_params)
     
@@ -722,6 +734,11 @@ def run_simulation(
     final_com_vel = np.zeros(3)
     total_energy = 0.0
     total_mass = sim.get_total_mass() if config.track_energy else 0.0
+    
+    # Track stability metrics for gait parameter policies
+    recent_dcm_errors = []
+    recent_zmp_violations = []
+    recent_speeds = []
 
     observation_spec = ObservationSpec.default()
     dataset_collector = None
@@ -868,8 +885,26 @@ def run_simulation(
                     v_ref_history.append(v_ref)
             
             dcm_current = mpc.compute_dcm(actual_com, actual_com_vel)
+            
+            # Track stability metrics for gait policies
+            dcm_error_mag = float(np.linalg.norm([dcm_current[0] - dcm_ref_x[0], dcm_current[1] - dcm_ref_y[0]]))
+            recent_dcm_errors.append(dcm_error_mag)
+            if len(recent_dcm_errors) > 100:
+                recent_dcm_errors.pop(0)
+            
+            if len(recent_speeds) > 0:
+                avg_speed_metric = float(np.mean(recent_speeds[-50:]))
+            else:
+                avg_speed_metric = 0.0
 
             phase_progress = state_machine.get_phase_progress(t)
+            
+            # Compute recent violation rate for observation
+            if len(recent_zmp_violations) > 0:
+                violation_rate = float(sum(recent_zmp_violations[-50:])) / min(50, len(recent_zmp_violations))
+            else:
+                violation_rate = 0.0
+            
             obs = build_observation(
                 com=actual_com,
                 com_vel=actual_com_vel,
@@ -880,7 +915,49 @@ def run_simulation(
                 phase_progress=phase_progress,
                 state=state_machine.state,
                 spec=observation_spec,
+                dcm_error=dcm_error_mag,
+                avg_speed=avg_speed_metric,
+                recent_violations=violation_rate,
             )
+
+            # Gait parameter policy: adjust stride, timing, and margins
+            if policy is not None and rl_config is not None and rl_config.policy_mode == "gait":
+                if step % rl_config.gait_update_steps == 0:
+                    policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
+                    if policy_action.shape[0] != 4:
+                        raise ValueError("Gait policy action must be 4D [stride_scale, ss_scale, ds_scale, margin_scale]")
+                    
+                    # Clip and scale actions
+                    clipped = np.clip(policy_action, -1.0, 1.0)
+                    stride_scale = rl_config.stride_range[0] + (rl_config.stride_range[1] - rl_config.stride_range[0]) * (clipped[0] + 1.0) / 2.0
+                    ss_scale = rl_config.ss_time_range[0] + (rl_config.ss_time_range[1] - rl_config.ss_time_range[0]) * (clipped[1] + 1.0) / 2.0
+                    ds_scale = rl_config.ds_time_range[0] + (rl_config.ds_time_range[1] - rl_config.ds_time_range[0]) * (clipped[2] + 1.0) / 2.0
+                    margin_scale = rl_config.margin_range[0] + (rl_config.margin_range[1] - rl_config.margin_range[0]) * (clipped[3] + 1.0) / 2.0
+                    
+                    new_params = np.array([stride_scale, ss_scale, ds_scale, margin_scale])
+                    
+                    # Apply if significantly different
+                    if np.linalg.norm(new_params - gait_params) > 0.05:
+                        gait_params = new_params
+                        
+                        # Update walking config (will affect future step planning)
+                        config.stride_length = base_stride * stride_scale
+                        walking_params.t_ss = base_t_ss * ss_scale
+                        walking_params.t_ds = base_t_ds * ds_scale
+                        
+                        # Update MPC margin
+                        mpc.update_weights(
+                            Q_dcm=base_Q_dcm,
+                            R_zmp=base_R_zmp,
+                            zmp_margin=base_margin * margin_scale,
+                        )
+                        
+                        # Update state machine timing
+                        state_machine.params.t_ss = walking_params.t_ss
+                        state_machine.params.t_ds = walking_params.t_ds
+                        
+                        if step % 500 == 0:
+                            print(f"  [GAIT UPDATE] stride={config.stride_length:.3f}m, t_ss={walking_params.t_ss:.2f}s, t_ds={walking_params.t_ds:.2f}s, margin={base_margin * margin_scale:.4f}m")
 
             if policy is not None and rl_config is not None and rl_config.policy_mode == "weights":
                 policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
@@ -952,6 +1029,8 @@ def run_simulation(
                     control_label = "RESIDUAL"
                 elif rl_config.policy_mode == "weights":
                     control_label = "WEIGHTS"
+                elif rl_config.policy_mode == "gait":
+                    control_label = "GAIT"
                 else:
                     raise ValueError(f"Unknown policy_mode: {rl_config.policy_mode}")
 
@@ -1050,8 +1129,19 @@ def run_simulation(
                 )
                 zmp_violations.append(violation)
                 state_violation_counts[current_walking_state][0] += 1  # Violations
+                recent_zmp_violations.append(1.0)
             else:
                 zmp_violations.append(0.0)
+                recent_zmp_violations.append(0.0)
+            
+            if len(recent_zmp_violations) > 100:
+                recent_zmp_violations.pop(0)
+            
+            # Track speed for gait policy
+            if len(com_vel_x_history) > 0:
+                recent_speeds.append(float(actual_com_vel[0]))
+                if len(recent_speeds) > 100:
+                    recent_speeds.pop(0)
                 
             dcm_err = np.sqrt((dcm_current[0] - dcm_ref_x[0])**2 + (dcm_current[1] - dcm_ref_y[0])**2)
             dcm_tracking_errors.append(dcm_err)
@@ -1428,7 +1518,7 @@ def main():
         "--cem-policy-mode",
         type=str,
         default="residual",
-        choices=["direct", "residual", "weights"],
+        choices=["direct", "residual", "weights", "gait"],
         help="Policy mode used during CEM training",
     )
     parser.add_argument("--policy", type=str, default=None, help="Path to a trained linear policy (.npz)")
@@ -1436,11 +1526,12 @@ def main():
         "--policy-mode",
         type=str,
         default="residual",
-        choices=["direct", "residual", "weights"],
-        help="How to apply policy: direct ZMP or residual on MPC",
+        choices=["direct", "residual", "weights", "gait"],
+        help="How to apply policy: direct ZMP, residual on MPC, MPC weight tuning, or gait parameter tuning",
     )
     parser.add_argument("--residual-clip", type=float, default=0.03, help="Residual ZMP clip (m)")
     parser.add_argument("--weight-update-steps", type=int, default=20, help="Steps between MPC weight updates")
+    parser.add_argument("--gait-update-steps", type=int, default=10, help="Steps between gait parameter updates")
     args = parser.parse_args()
     
     config = SimulationConfig(
@@ -1488,6 +1579,7 @@ def main():
             policy_mode=args.policy_mode,
             residual_clip=args.residual_clip,
             weight_update_steps=args.weight_update_steps,
+            gait_update_steps=args.gait_update_steps,
         )
 
     run_simulation(
