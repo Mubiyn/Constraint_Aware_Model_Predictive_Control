@@ -905,6 +905,14 @@ def run_simulation(
             else:
                 violation_rate = 0.0
             
+            # Normalize current gait parameters for observation
+            current_stride_norm = (config.stride_length - 0.12) / (0.18 - 0.12)  # [0.12, 0.18] → [0, 1]
+            current_t_ss_norm = (walking_params.t_ss - 0.6) / (1.0 - 0.6)  # [0.6, 1.0] → [0, 1]
+            current_t_ds_norm = (walking_params.t_ds - 0.5) / (1.0 - 0.5)  # [0.5, 1.0] → [0, 1]
+            # Get current margin from MPC (base_margin * current scale)
+            current_margin = base_margin * gait_params[3]
+            current_margin_norm = (current_margin - 0.015) / (0.03 - 0.015)  # [0.015, 0.03] → [0, 1]
+            
             obs = build_observation(
                 com=actual_com,
                 com_vel=actual_com_vel,
@@ -918,6 +926,10 @@ def run_simulation(
                 dcm_error=dcm_error_mag,
                 avg_speed=avg_speed_metric,
                 recent_violations=violation_rate,
+                current_stride=current_stride_norm,
+                current_t_ss=current_t_ss_norm,
+                current_t_ds=current_t_ds_norm,
+                current_margin=current_margin_norm,
             )
 
             # Gait parameter policy: adjust stride, timing, and margins
@@ -927,21 +939,39 @@ def run_simulation(
                     if policy_action.shape[0] != 4:
                         raise ValueError("Gait policy action must be 4D [stride_scale, ss_scale, ds_scale, margin_scale]")
                     
-                    # Clip and scale actions
+                    # Aggressive clipping to prevent numerical explosions
                     clipped = np.clip(policy_action, -1.0, 1.0)
+                    
+                    # Additional safety: clip to prevent NaN/Inf
+                    if not np.all(np.isfinite(clipped)):
+                        print(f"  [WARNING] Non-finite policy action: {policy_action}, resetting to zero")
+                        clipped = np.zeros_like(clipped)
+                    
                     stride_scale = rl_config.stride_range[0] + (rl_config.stride_range[1] - rl_config.stride_range[0]) * (clipped[0] + 1.0) / 2.0
                     ss_scale = rl_config.ss_time_range[0] + (rl_config.ss_time_range[1] - rl_config.ss_time_range[0]) * (clipped[1] + 1.0) / 2.0
                     ds_scale = rl_config.ds_time_range[0] + (rl_config.ds_time_range[1] - rl_config.ds_time_range[0]) * (clipped[2] + 1.0) / 2.0
                     margin_scale = rl_config.margin_range[0] + (rl_config.margin_range[1] - rl_config.margin_range[0]) * (clipped[3] + 1.0) / 2.0
                     
+                    # Final safety bounds (hard limits)
+                    stride_scale = np.clip(stride_scale, 0.6, 2.0)  # Prevent extreme strides
+                    ss_scale = np.clip(ss_scale, 0.5, 1.2)
+                    ds_scale = np.clip(ds_scale, 0.4, 1.2)
+                    margin_scale = np.clip(margin_scale, 0.3, 2.0)
+                    
                     new_params = np.array([stride_scale, ss_scale, ds_scale, margin_scale])
+                    
+                    # Validate before applying
+                    proposed_stride = base_stride * stride_scale
+                    if proposed_stride > 0.5 or proposed_stride < 0.05:
+                        print(f"  [WARNING] Unsafe stride {proposed_stride:.3f}m, keeping current parameters")
+                        continue
                     
                     # Apply if significantly different
                     if np.linalg.norm(new_params - gait_params) > 0.05:
                         gait_params = new_params
                         
                         # Update walking config (will affect future step planning)
-                        config.stride_length = base_stride * stride_scale
+                        config.stride_length = proposed_stride
                         walking_params.t_ss = base_t_ss * ss_scale
                         walking_params.t_ds = base_t_ds * ds_scale
                         

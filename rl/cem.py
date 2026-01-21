@@ -54,8 +54,8 @@ def _score_metrics(metrics, policy_mode: str = "residual") -> float:
         return float(score)  # Early exit for falls
     
     if policy_mode == "gait":
-        # Gait policy: prioritize speed with stability constraints
-        score += 50.0 * metrics.avg_speed_mps  # Primary objective: speed
+        # Gait policy: prioritize speed with stability constraints (aggressive)
+        score += 150.0 * metrics.avg_speed_mps  # Primary objective: speed (increased from 50)
         score += 100.0 * metrics.zmp_compliance  # Maintain safety
         score -= 100.0 * metrics.max_zmp_violation  # Heavy penalty for violations
         score -= 20.0 * metrics.avg_dcm_error  # Stability

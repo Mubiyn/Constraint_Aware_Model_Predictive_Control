@@ -28,7 +28,8 @@ class ObservationSpec:
     def dim(self) -> int:
         # com_xy + com_vel_xy + dcm_xy + dcm_ref_xy + zmp_bounds_x + zmp_bounds_y
         # + phase_progress + state_one_hot + dcm_error + avg_speed + recent_violations
-        return 2 + 2 + 2 + 2 + 2 + 2 + 1 + len(self.state_order) + 1 + 1 + 1
+        # + current_stride + current_t_ss + current_t_ds + current_margin
+        return 2 + 2 + 2 + 2 + 2 + 2 + 1 + len(self.state_order) + 1 + 1 + 1 + 4
 
 
 def build_observation(
@@ -44,6 +45,10 @@ def build_observation(
     dcm_error: float = 0.0,
     avg_speed: float = 0.0,
     recent_violations: float = 0.0,
+    current_stride: float = 0.0,
+    current_t_ss: float = 0.0,
+    current_t_ds: float = 0.0,
+    current_margin: float = 0.0,
 ) -> np.ndarray:
     """Build a flat observation vector.
 
@@ -87,5 +92,9 @@ def build_observation(
             np.array([float(dcm_error)]),
             np.array([float(avg_speed)]),
             np.array([float(recent_violations)]),
+            np.array([float(current_stride)]),
+            np.array([float(current_t_ss)]),
+            np.array([float(current_t_ds)]),
+            np.array([float(current_margin)]),
         ]
     )
