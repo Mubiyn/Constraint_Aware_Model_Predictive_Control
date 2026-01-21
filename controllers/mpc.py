@@ -325,6 +325,23 @@ class MPCController:
         self._prev_solution = None
         self._prev_zmp = 0.0
 
+    def update_weights(
+        self,
+        Q_dcm: Optional[float] = None,
+        R_zmp: Optional[float] = None,
+        zmp_margin: Optional[float] = None,
+        max_zmp_rate: Optional[float] = None,
+    ) -> None:
+        if Q_dcm is not None:
+            self.params.Q_dcm = float(Q_dcm)
+        if R_zmp is not None:
+            self.params.R_zmp = float(R_zmp)
+        if zmp_margin is not None:
+            self.params.zmp_margin = float(zmp_margin)
+        if max_zmp_rate is not None:
+            self.params.max_zmp_rate = float(max_zmp_rate)
+        self._build_qp_matrices()
+
 
 class DecoupledMPCController:
     """Decoupled DCM-based MPC for x and y axes.
@@ -414,6 +431,16 @@ class DecoupledMPCController:
         self.mpc_x.reset()
         self.mpc_y.reset()
         self._current_zmp = np.zeros(2)
+
+    def update_weights(
+        self,
+        Q_dcm: Optional[float] = None,
+        R_zmp: Optional[float] = None,
+        zmp_margin: Optional[float] = None,
+        max_zmp_rate: Optional[float] = None,
+    ) -> None:
+        self.mpc_x.update_weights(Q_dcm=Q_dcm, R_zmp=R_zmp, zmp_margin=zmp_margin, max_zmp_rate=max_zmp_rate)
+        self.mpc_y.update_weights(Q_dcm=Q_dcm, R_zmp=R_zmp, zmp_margin=zmp_margin, max_zmp_rate=max_zmp_rate)
 
 
 class DCMTrajectoryGenerator:

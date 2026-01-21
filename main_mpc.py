@@ -33,6 +33,7 @@ from v2.rl.dataset import DatasetCollector
 from v2.rl.policy import LinearPolicy
 from v2.rl.obs import ObservationSpec, build_observation
 from v2.rl.bc import fit_linear_policy
+from v2.rl.cem import CEMConfig, train_residual_cem
 
 
 @dataclass
@@ -90,6 +91,7 @@ class RLConfig:
     policy_path: Optional[Path] = None
     policy_mode: str = "residual"  # "direct" or "residual"
     residual_clip: float = 0.03
+    weight_update_steps: int = 20
 
 
 def compute_zmp_reference(
@@ -639,6 +641,10 @@ def run_simulation(
     
     mpc = DecoupledMPCController(mpc_params)
     omega = mpc.omega
+    base_Q_dcm = mpc_params.Q_dcm
+    base_R_zmp = mpc_params.R_zmp
+    base_zmp_margin = mpc_params.zmp_margin
+    weight_scales = np.array([1.0, 1.0, 1.0])
     
     lipm_params = LIPMParams(z_c=config.z_c, dt=config.dt)
     lipm = DecoupledLIPM(lipm_params)
@@ -862,7 +868,37 @@ def run_simulation(
                     v_ref_history.append(v_ref)
             
             dcm_current = mpc.compute_dcm(actual_com, actual_com_vel)
-            
+
+            phase_progress = state_machine.get_phase_progress(t)
+            obs = build_observation(
+                com=actual_com,
+                com_vel=actual_com_vel,
+                dcm=dcm_current,
+                dcm_ref=np.array([dcm_ref_x[0], dcm_ref_y[0]]),
+                zmp_bounds_x=np.array([bounds_x[0][0], bounds_x[1][0]]),
+                zmp_bounds_y=np.array([bounds_y[0][0], bounds_y[1][0]]),
+                phase_progress=phase_progress,
+                state=state_machine.state,
+                spec=observation_spec,
+            )
+
+            if policy is not None and rl_config is not None and rl_config.policy_mode == "weights":
+                policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
+                if policy_action.shape[0] != 3:
+                    raise ValueError("Weight policy action must be 3D [Q_dcm, R_zmp, zmp_margin]")
+                clipped = np.clip(policy_action, -1.0, 1.0)
+                q_scale = 1.0 + 0.5 * clipped[0]
+                r_scale = 1.0 + 0.8 * clipped[1]
+                m_scale = 1.0 + 0.5 * clipped[2]
+                scales = np.array([q_scale, r_scale, m_scale])
+                if step % rl_config.weight_update_steps == 0 and np.linalg.norm(scales - weight_scales) > 0.05:
+                    mpc.update_weights(
+                        Q_dcm=base_Q_dcm * q_scale,
+                        R_zmp=base_R_zmp * r_scale,
+                        zmp_margin=base_zmp_margin * m_scale,
+                    )
+                    weight_scales = scales
+
             if config.use_mpc:
                 start_time = time.time()
                 zmp_des, info = mpc.compute_control(
@@ -892,32 +928,21 @@ def run_simulation(
             
             zmp_des_mpc = zmp_des.copy()
 
-            phase_progress = state_machine.get_phase_progress(t)
-            obs = build_observation(
-                com=actual_com,
-                com_vel=actual_com_vel,
-                dcm=dcm_current,
-                dcm_ref=np.array([dcm_ref_x[0], dcm_ref_y[0]]),
-                zmp_bounds_x=np.array([bounds_x[0][0], bounds_x[1][0]]),
-                zmp_bounds_y=np.array([bounds_y[0][0], bounds_y[1][0]]),
-                phase_progress=phase_progress,
-                state=state_machine.state,
-                spec=observation_spec,
-            )
-
-            if dataset_collector is not None:
+            if dataset_collector is not None and rl_config is not None and rl_config.policy_mode in ("direct", "residual"):
                 dataset_collector.add(obs, zmp_des_mpc)
 
             control_label = "MPC"
 
-            if policy is not None:
+            if policy is not None and rl_config is not None:
                 policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
-                if policy_action.shape[0] != 2:
-                    raise ValueError("Policy action must be 2D [zmp_x, zmp_y]")
                 if rl_config.policy_mode == "direct":
+                    if policy_action.shape[0] != 2:
+                        raise ValueError("Policy action must be 2D [zmp_x, zmp_y]")
                     zmp_des = policy_action
                     control_label = "POLICY"
                 elif rl_config.policy_mode == "residual":
+                    if policy_action.shape[0] != 2:
+                        raise ValueError("Policy action must be 2D [zmp_x, zmp_y]")
                     residual = np.clip(
                         policy_action,
                         -rl_config.residual_clip,
@@ -925,6 +950,8 @@ def run_simulation(
                     )
                     zmp_des = zmp_des + residual
                     control_label = "RESIDUAL"
+                elif rl_config.policy_mode == "weights":
+                    control_label = "WEIGHTS"
                 else:
                     raise ValueError(f"Unknown policy_mode: {rl_config.policy_mode}")
 
@@ -1389,15 +1416,31 @@ def main():
     parser.add_argument("--collect-bc", type=str, default=None, help="Path to save MPC rollout dataset (.npz)")
     parser.add_argument("--train-bc", type=str, default=None, help="Path to dataset (.npz) for training a linear policy")
     parser.add_argument("--bc-output", type=str, default="v2/rl/linear_policy.npz", help="Output path for trained policy")
+    parser.add_argument("--train-residual-cem", action="store_true", help="Train residual policy with CEM")
+    parser.add_argument("--cem-output", type=str, default="v2/rl/residual_cem.npz", help="Output path for CEM policy")
+    parser.add_argument("--cem-iters", type=int, default=20, help="CEM iterations")
+    parser.add_argument("--cem-pop", type=int, default=24, help="CEM population size")
+    parser.add_argument("--cem-elite", type=float, default=0.25, help="CEM elite fraction")
+    parser.add_argument("--cem-steps", type=int, default=None, help="Max steps per CEM rollout")
+    parser.add_argument("--cem-clip", type=float, default=0.03, help="Residual clip for CEM rollouts")
+    parser.add_argument("--cem-action-dim", type=int, default=2, help="CEM action dimension")
+    parser.add_argument(
+        "--cem-policy-mode",
+        type=str,
+        default="residual",
+        choices=["direct", "residual", "weights"],
+        help="Policy mode used during CEM training",
+    )
     parser.add_argument("--policy", type=str, default=None, help="Path to a trained linear policy (.npz)")
     parser.add_argument(
         "--policy-mode",
         type=str,
         default="residual",
-        choices=["direct", "residual"],
+        choices=["direct", "residual", "weights"],
         help="How to apply policy: direct ZMP or residual on MPC",
     )
     parser.add_argument("--residual-clip", type=float, default=0.03, help="Residual ZMP clip (m)")
+    parser.add_argument("--weight-update-steps", type=int, default=20, help="Steps between MPC weight updates")
     args = parser.parse_args()
     
     config = SimulationConfig(
@@ -1412,6 +1455,21 @@ def main():
         output_path = Path(args.bc_output)
         fit_linear_policy(dataset_path, output_path)
         print(f"Trained linear policy saved to {output_path}")
+        return
+
+    if args.train_residual_cem:
+        cem_config = CEMConfig(
+            iterations=args.cem_iters,
+            population=args.cem_pop,
+            elite_frac=args.cem_elite,
+            eval_steps=args.cem_steps,
+            residual_clip=args.cem_clip,
+            action_dim=args.cem_action_dim,
+            policy_mode=args.cem_policy_mode,
+        )
+        output_path = Path(args.cem_output)
+        train_residual_cem(config, output_path, cem_config)
+        print(f"CEM residual policy saved to {output_path}")
         return
 
     if args.validate_mpc:
@@ -1429,6 +1487,7 @@ def main():
             policy_path=Path(args.policy) if args.policy is not None else None,
             policy_mode=args.policy_mode,
             residual_clip=args.residual_clip,
+            weight_update_steps=args.weight_update_steps,
         )
 
     run_simulation(
