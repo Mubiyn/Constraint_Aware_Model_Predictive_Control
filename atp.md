@@ -109,46 +109,35 @@ The MPC controller was implemented using a **DCM (Divergent Component of Motion)
 
 | ID | Test Case | Result | Measured Value |
 | :--- | :--- | :--- | :--- |
-| 1 | Steady-State Walking | **PASS** | Successfully completed 10-step walking sequence (~1.2m distance) |
-| 2 | ZMP Boundary Test | **PARTIAL** | 73.1% ZMP constraint compliance (max violation: 0.026m) |
-| 3 | External Perturbation | **PASS** | Recovered from **100N** lateral push (exceeds 40N requirement by 150%) |
-| 4 | Velocity Tracking | **PASS** | DCM tracking error: 0.027m average, 0.056m max |
-| 5 | Energy Efficiency | **PENDING** | Baseline comparison not performed |
+| 1 | Steady-State Walking | **PASS** | 10m walk completed (distance: 10.07m, fell: False) |
+| 2 | ZMP Boundary Test | **PARTIAL** | ZMP compliance: 98.2% (max violation: 0.0575m) |
+| 3 | External Perturbation | **PASS** | Recovered from 40N lateral push (fell: False) |
+| 4 | Velocity Tracking | **FAIL** | Forward velocity MAE: 0.0327 m/s (target ≤ 0.02 m/s), avg v=0.0425 m/s |
+| 5 | Energy Efficiency | **FAIL** | CoT MPC=1.0101, Baseline=1.0101 (reduction: 0.0%) |
 | 6 | Stop-and-Go | **PASS** | Robot successfully stops at final position with stable CoM |
 
 ### 11.3 Key Metrics
 
 | Metric | Target | Achieved | Status |
 | :--- | :--- | :--- | :--- |
-| Real-time Execution | ≥100 Hz | 100 Hz (5.0ms avg solve time) | **PASS** |
-| Disturbance Rejection | ≥40N push | ≥100N push survived | **PASS** |
-| ZMP Compliance | 100% | 73.1% | **PARTIAL** |
-| MPC Solve Time | <15ms | 5.0ms avg, 25ms max | **PASS** |
+| Real-time Execution | ≥100 Hz | 100 Hz (~3.9ms avg solve time) | **PASS** |
+| Disturbance Rejection | ≥40N push | 40N push survived (fell: False) | **PASS** |
+| ZMP Compliance | 100% | 98.2% | **PARTIAL** |
+| MPC Solve Time | <15ms | ~3.9ms avg, 30.5ms max | **PARTIAL** |
 
 ### 11.4 Detailed Disturbance Test Results
 
-Tested with 40N, 60N, and 100N lateral pushes during single-support phase:
+Tested with a 40N lateral push during the walking sequence:
 
 ```
-40N Push at t=8.01s (SS_RIGHT):
-  - Simulation completed: YES (30.5s)
-  - Final CoM position: [1.196, -0.082, 0.859]
-  - ZMP Compliance: 73.1%
-
-60N Push at t=8.01s (SS_RIGHT):
-  - Simulation completed: YES (30.5s)
-  - Final CoM position: [1.196, -0.083, 0.859]
-  - ZMP Compliance: 73.1%
-
-100N Push at t=8.01s (SS_RIGHT):
-  - Simulation completed: YES (30.5s)
-  - Final CoM position: [1.195, -0.082, 0.859]
-  - ZMP Compliance: 73.2%
+40N Push:
+  - Outcome: fell=False
+  - Notes: System remained stable and completed the test sequence.
 ```
 
 ### 11.5 Known Limitations
 
-1. **ZMP Constraint Compliance**: The 73% compliance rate indicates that the MPC sometimes produces ZMP commands outside the support polygon. This is compensated by DCM feedback control clipping the ZMP to bounds. Improvement strategies:
+1. **ZMP Constraint Compliance**: The ~98% compliance rate indicates the MPC occasionally produces ZMP commands outside the support polygon. This is compensated by DCM feedback control clipping the ZMP to bounds. Improvement strategies:
    - Tighten support polygon margins
    - Increase QP constraint penalties
    - Use soft constraints with slack variables
@@ -157,6 +146,21 @@ Tested with 40N, 60N, and 100N lateral pushes during single-support phase:
    - Better DCM reference trajectory generation
    - Angular momentum regulation
    - Ankle torque optimization
+
+### 11.6 Reinforcement Learning Extension Results (Gait Parameter Tuning)
+
+This extension evaluates a lightweight RL-style optimization (CEM over a linear policy) that adjusts gait parameters (stride/timing/margins) at runtime while keeping the underlying DCM-MPC controller unchanged.
+
+**Policy artifact**: `v2/rl/gait_cem_v2.npz`
+
+**Evaluation (10-step walk, no GUI, eval mode)**:
+
+| Controller | Distance (m) | Avg Speed (m/s) | ZMP Compliance (%) | Avg DCM Error (m) | Fell |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Baseline MPC | 1.192 | 0.041 | 98.2 | 0.0218 | False |
+| MPC + Gait Policy | 1.199 | 0.050 | 96.1 | 0.0233 | False |
+
+**Interpretation**: The gait policy increases average speed for the 10-step sequence, at the cost of a modest reduction in ZMP constraint compliance.
 
 ## 12. Conclusion
 This ATP provides a rigorous framework for validating an advanced MPC controller in a non-MATLAB environment. By focusing on numerical optimization and hard physical constraints, with a potential extension into Reinforcement Learning for adaptive robustness, this research ensures a measurable improvement in the stability and efficiency of humanoid locomotion over classical batch-processed methods.

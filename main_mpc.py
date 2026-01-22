@@ -10,6 +10,7 @@ Uses DCM (Divergent Component of Motion) based MPC for stable walking:
 - Real-time QP solving for online optimization
 """
 import argparse
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -487,6 +488,8 @@ def run_simulation(
     print_every: int = 50,
     rl_config: Optional[RLConfig] = None,
     return_metrics: bool = False,
+    record_path: Optional[str] = None,
+    log_path: Optional[str] = None,
 ):
     """Run the MPC walking simulation.
     
@@ -541,6 +544,9 @@ def run_simulation(
         solver_iterations=config.solver_iterations
     )
     sim.reset_configuration(q_init)
+
+    if record_path is not None:
+        sim.start_recording(record_path)
     
     print("Phase 1: Zero-gravity settling...")
     sim.pb.setGravity(0, 0, 0)
@@ -657,6 +663,8 @@ def run_simulation(
     base_t_ds = config.t_ds
     base_margin = mpc_params.zmp_margin
     gait_params = np.array([1.0, 1.0, 1.0, 1.0])  # stride, ss, ds, margin scales
+    current_stride_length = float(base_stride)
+    current_margin = float(base_margin)
     
     lipm_params = LIPMParams(z_c=config.z_c, dt=config.dt)
     lipm = DecoupledLIPM(lipm_params)
@@ -740,6 +748,26 @@ def run_simulation(
     recent_zmp_violations = []
     recent_speeds = []
 
+    log_t = []
+    log_state = []
+    log_step_idx = []
+    log_com = []
+    log_com_vel = []
+    log_zmp = []
+    log_zmp_bounds = []  # [xmin, xmax, ymin, ymax]
+    log_zmp_violation = []
+    log_dcm = []
+    log_dcm_ref = []
+    log_dcm_err = []
+    log_solve_ms = []
+    log_v_ref = []
+    log_stride = []
+    log_t_ss = []
+    log_t_ds = []
+    log_margin = []
+    log_push = []
+    log_control_mode = []
+
     observation_spec = ObservationSpec.default()
     dataset_collector = None
     policy = None
@@ -759,6 +787,10 @@ def run_simulation(
     
     for step in range(n_sim_steps):
         rf_force, lf_force = sim.get_contact_forces()
+
+        actual_com = sim.get_com_position()
+        actual_com_vel = sim.get_com_velocity()
+        actual_zmp_for_log = sim.get_zmp_position()
         
         # Log force asymmetry
         total_force = rf_force + lf_force
@@ -773,6 +805,16 @@ def run_simulation(
             })
         
         state_changed = state_machine.update(t, rf_force, lf_force)
+
+        zmp_bounds_for_log = np.full(4, np.nan, dtype=float)
+        zmp_violation_for_log = float("nan")
+        dcm_for_log = np.full(2, np.nan, dtype=float)
+        dcm_ref_for_log = np.full(2, np.nan, dtype=float)
+        dcm_err_for_log = float("nan")
+        v_ref_for_log = float("nan")
+        solve_ms_for_log = 0.0
+        control_mode_for_log = "DIRECT"
+        push_active_for_log = False
         
         if state_changed:
             if state_machine.is_single_support():
@@ -845,7 +887,6 @@ def run_simulation(
             com_target_x = end_com_start[0] + progress_smooth * (mid_x - end_com_start[0])
             com_target_y = end_com_start[1] + progress_smooth * (mid_y - end_com_start[1])
 
-            actual_com_vel = sim.get_com_velocity()
             final_com_vel = actual_com_vel.copy()
             
             com_target = np.array([com_target_x, com_target_y, config.z_c])
@@ -875,20 +916,22 @@ def run_simulation(
             mpc_bounds_x = bounds_x
             mpc_bounds_y = bounds_y
 
-            actual_com = sim.get_com_position()
-            actual_com_vel = sim.get_com_velocity()
             final_com_vel = actual_com_vel.copy()
             if state_machine.state in (WalkingState.SS_LEFT, WalkingState.SS_RIGHT, WalkingState.DS):
                 if t > walking_params.t_init + 0.5:
                     com_vel_x_history.append(actual_com_vel[0])
-                    v_ref = config.stride_length / (walking_params.t_ss + walking_params.t_ds)
+                    v_ref = current_stride_length / (walking_params.t_ss + walking_params.t_ds)
                     v_ref_history.append(v_ref)
+                    v_ref_for_log = float(v_ref)
             
             dcm_current = mpc.compute_dcm(actual_com, actual_com_vel)
+            dcm_for_log = np.array([float(dcm_current[0]), float(dcm_current[1])], dtype=float)
             
             # Track stability metrics for gait policies
             dcm_error_mag = float(np.linalg.norm([dcm_current[0] - dcm_ref_x[0], dcm_current[1] - dcm_ref_y[0]]))
             recent_dcm_errors.append(dcm_error_mag)
+            dcm_ref_for_log = np.array([float(dcm_ref_x[0]), float(dcm_ref_y[0])], dtype=float)
+            dcm_err_for_log = float(dcm_error_mag)
             if len(recent_dcm_errors) > 100:
                 recent_dcm_errors.pop(0)
             
@@ -905,13 +948,21 @@ def run_simulation(
             else:
                 violation_rate = 0.0
             
-            # Normalize current gait parameters for observation
-            current_stride_norm = (config.stride_length - 0.12) / (0.18 - 0.12)  # [0.12, 0.18] → [0, 1]
-            current_t_ss_norm = (walking_params.t_ss - 0.6) / (1.0 - 0.6)  # [0.6, 1.0] → [0, 1]
-            current_t_ds_norm = (walking_params.t_ds - 0.5) / (1.0 - 0.5)  # [0.5, 1.0] → [0, 1]
-            # Get current margin from MPC (base_margin * current scale)
-            current_margin = base_margin * gait_params[3]
-            current_margin_norm = (current_margin - 0.015) / (0.03 - 0.015)  # [0.015, 0.03] → [0, 1]
+            # Normalize current gait parameters for observation (use absolute safe ranges)
+            stride_abs_min, stride_abs_max = 0.05, 0.30
+            t_ss_abs_min, t_ss_abs_max = 0.3, 2.0
+            t_ds_abs_min, t_ds_abs_max = 0.3, 2.0
+            margin_abs_min, margin_abs_max = 0.005, 0.05
+
+            current_stride_norm = (current_stride_length - stride_abs_min) / (stride_abs_max - stride_abs_min)
+            current_t_ss_norm = (walking_params.t_ss - t_ss_abs_min) / (t_ss_abs_max - t_ss_abs_min)
+            current_t_ds_norm = (walking_params.t_ds - t_ds_abs_min) / (t_ds_abs_max - t_ds_abs_min)
+            current_margin_norm = (current_margin - margin_abs_min) / (margin_abs_max - margin_abs_min)
+
+            current_stride_norm = float(np.clip(current_stride_norm, 0.0, 1.0))
+            current_t_ss_norm = float(np.clip(current_t_ss_norm, 0.0, 1.0))
+            current_t_ds_norm = float(np.clip(current_t_ds_norm, 0.0, 1.0))
+            current_margin_norm = float(np.clip(current_margin_norm, 0.0, 1.0))
             
             obs = build_observation(
                 com=actual_com,
@@ -958,36 +1009,51 @@ def run_simulation(
                     ds_scale = np.clip(ds_scale, 0.4, 1.2)
                     margin_scale = np.clip(margin_scale, 0.3, 2.0)
                     
-                    new_params = np.array([stride_scale, ss_scale, ds_scale, margin_scale])
-                    
-                    # Validate before applying
-                    proposed_stride = base_stride * stride_scale
-                    if proposed_stride > 0.5 or proposed_stride < 0.05:
-                        print(f"  [WARNING] Unsafe stride {proposed_stride:.3f}m, keeping current parameters")
-                        continue
+                    # Apply absolute safety bounds (hard limits)
+                    stride_abs_min, stride_abs_max = 0.05, 0.30
+                    t_ss_abs_min, t_ss_abs_max = 0.3, 2.0
+                    t_ds_abs_min, t_ds_abs_max = 0.3, 2.0
+                    margin_abs_min, margin_abs_max = 0.005, 0.05
+
+                    proposed_stride_unclamped = float(base_stride * stride_scale)
+                    proposed_t_ss_unclamped = float(base_t_ss * ss_scale)
+                    proposed_t_ds_unclamped = float(base_t_ds * ds_scale)
+                    proposed_margin_unclamped = float(base_margin * margin_scale)
+
+                    proposed_stride = float(np.clip(proposed_stride_unclamped, stride_abs_min, stride_abs_max))
+                    proposed_t_ss = float(np.clip(proposed_t_ss_unclamped, t_ss_abs_min, t_ss_abs_max))
+                    proposed_t_ds = float(np.clip(proposed_t_ds_unclamped, t_ds_abs_min, t_ds_abs_max))
+                    proposed_margin = float(np.clip(proposed_margin_unclamped, margin_abs_min, margin_abs_max))
+
+                    stride_scale = proposed_stride / max(base_stride, 1e-9)
+                    ss_scale = proposed_t_ss / max(base_t_ss, 1e-9)
+                    ds_scale = proposed_t_ds / max(base_t_ds, 1e-9)
+                    margin_scale = proposed_margin / max(base_margin, 1e-9)
+                    new_params = np.array([stride_scale, ss_scale, ds_scale, margin_scale], dtype=float)
                     
                     # Apply if significantly different
                     if np.linalg.norm(new_params - gait_params) > 0.05:
                         gait_params = new_params
                         
-                        # Update walking config (will affect future step planning)
-                        config.stride_length = proposed_stride
-                        walking_params.t_ss = base_t_ss * ss_scale
-                        walking_params.t_ds = base_t_ds * ds_scale
+                        # Update tracked gait params (do not mutate config; it is reused by CEM)
+                        current_stride_length = proposed_stride
+                        walking_params.t_ss = proposed_t_ss
+                        walking_params.t_ds = proposed_t_ds
                         
                         # Update MPC margin
                         mpc.update_weights(
                             Q_dcm=base_Q_dcm,
                             R_zmp=base_R_zmp,
-                            zmp_margin=base_margin * margin_scale,
+                            zmp_margin=proposed_margin,
                         )
+                        current_margin = proposed_margin
                         
                         # Update state machine timing
                         state_machine.params.t_ss = walking_params.t_ss
                         state_machine.params.t_ds = walking_params.t_ds
                         
                         if step % 500 == 0:
-                            print(f"  [GAIT UPDATE] stride={config.stride_length:.3f}m, t_ss={walking_params.t_ss:.2f}s, t_ds={walking_params.t_ds:.2f}s, margin={base_margin * margin_scale:.4f}m")
+                            print(f"  [GAIT UPDATE] stride={current_stride_length:.3f}m, t_ss={walking_params.t_ss:.2f}s, t_ds={walking_params.t_ds:.2f}s, margin={current_margin:.4f}m")
 
             if policy is not None and rl_config is not None and rl_config.policy_mode == "weights":
                 policy_action = np.asarray(policy.act(obs), dtype=float).reshape(-1)
@@ -1015,7 +1081,8 @@ def run_simulation(
                     mpc_bounds_x, mpc_bounds_y
                 )
                 solve_time = time.time() - start_time
-                solve_times.append(solve_time * 1000)
+                solve_ms_for_log = float(solve_time * 1000)
+                solve_times.append(solve_ms_for_log)
                 
                 zmp_des[0] = np.clip(zmp_des[0], bounds_x[0][0], bounds_x[1][0])
                 zmp_des[1] = np.clip(zmp_des[1], bounds_y[0][0], bounds_y[1][0])
@@ -1032,6 +1099,7 @@ def run_simulation(
                     np.clip(zmp_y_fb, bounds_y[0][0], bounds_y[1][0])
                 ])
                 solve_times.append(0.0)
+                solve_ms_for_log = 0.0
             
             zmp_des_mpc = zmp_des.copy()
 
@@ -1059,10 +1127,13 @@ def run_simulation(
                     control_label = "RESIDUAL"
                 elif rl_config.policy_mode == "weights":
                     control_label = "WEIGHTS"
+
                 elif rl_config.policy_mode == "gait":
                     control_label = "GAIT"
                 else:
                     raise ValueError(f"Unknown policy_mode: {rl_config.policy_mode}")
+
+            control_mode_for_log = str(control_label)
 
             zmp_des[0] = np.clip(zmp_des[0], bounds_x[0][0], bounds_x[1][0])
             zmp_des[1] = np.clip(zmp_des[1], bounds_y[0][0], bounds_y[1][0])
@@ -1130,6 +1201,12 @@ def run_simulation(
                 fell = True
                 break
             zmp_history.append(actual_zmp.copy())
+
+            actual_zmp_for_log = actual_zmp.copy()
+            zmp_bounds_for_log = np.array(
+                [bounds_x[0][0], bounds_x[1][0], bounds_y[0][0], bounds_y[1][0]],
+                dtype=float,
+            )
             
             # Diagnostic: Monitor torso orientation
             talos.update_kinematics(q)
@@ -1158,10 +1235,12 @@ def run_simulation(
                     max(bounds_y[0][0] - actual_zmp[1], actual_zmp[1] - bounds_y[1][0], 0)
                 )
                 zmp_violations.append(violation)
+                zmp_violation_for_log = float(violation)
                 state_violation_counts[current_walking_state][0] += 1  # Violations
                 recent_zmp_violations.append(1.0)
             else:
                 zmp_violations.append(0.0)
+                zmp_violation_for_log = 0.0
                 recent_zmp_violations.append(0.0)
             
             if len(recent_zmp_violations) > 100:
@@ -1175,6 +1254,8 @@ def run_simulation(
                 
             dcm_err = np.sqrt((dcm_current[0] - dcm_ref_x[0])**2 + (dcm_current[1] - dcm_ref_y[0])**2)
             dcm_tracking_errors.append(dcm_err)
+
+            dcm_err_for_log = float(dcm_err_for_log) if np.isfinite(dcm_err_for_log) else float(dcm_err)
         
         if state_machine.is_single_support() and swing_start_pos is not None and swing_target_pos is not None:
             phase = state_machine.get_phase_progress(t)
@@ -1242,6 +1323,7 @@ def run_simulation(
             if dist_start <= t < dist_end:
                 force = np.array([0.0, config.disturbance_force, 0.0])
                 sim.apply_external_force(force, link_index=-1)
+                push_active_for_log = True
                 if abs(t - dist_start) < config.dt:
                     state_str = state_machine.state.name
                     print(f"\n*** APPLYING {config.disturbance_force}N LATERAL PUSH at t={t:.2f}s (state={state_str}) ***\n")
@@ -1262,7 +1344,6 @@ def run_simulation(
             disp_info = f"Target CoM: [{com_target[0]:.3f}, {com_target[1]:.3f}]"
             
         if step % print_every == 0:
-            actual_com = sim.get_com_position()
             zmp = sim.get_zmp_position()
             base_height = sim.get_base_height()
             
@@ -1278,6 +1359,31 @@ def run_simulation(
             )
             
         t += config.dt
+
+        log_t.append(float(t))
+        log_state.append(int(state_machine.state.value))
+        log_step_idx.append(int(state_machine.step_idx))
+        log_com.append(np.asarray(actual_com, dtype=float))
+        log_com_vel.append(np.asarray(actual_com_vel, dtype=float))
+
+        if actual_zmp_for_log is None:
+            log_zmp.append(np.array([np.nan, np.nan], dtype=float))
+        else:
+            log_zmp.append(np.asarray(actual_zmp_for_log[:2], dtype=float))
+
+        log_zmp_bounds.append(np.asarray(zmp_bounds_for_log, dtype=float))
+        log_zmp_violation.append(float(zmp_violation_for_log) if np.isfinite(zmp_violation_for_log) else np.nan)
+        log_dcm.append(np.asarray(dcm_for_log, dtype=float))
+        log_dcm_ref.append(np.asarray(dcm_ref_for_log, dtype=float))
+        log_dcm_err.append(float(dcm_err_for_log) if np.isfinite(dcm_err_for_log) else np.nan)
+        log_solve_ms.append(float(solve_ms_for_log))
+        log_v_ref.append(float(v_ref_for_log) if np.isfinite(v_ref_for_log) else np.nan)
+        log_stride.append(float(current_stride_length))
+        log_t_ss.append(float(walking_params.t_ss))
+        log_t_ds.append(float(walking_params.t_ds))
+        log_margin.append(float(current_margin))
+        log_push.append(1.0 if push_active_for_log else 0.0)
+        log_control_mode.append(str(control_mode_for_log))
         
         if not state_machine.is_walking() and state_machine.state == WalkingState.END:
             elapsed_end = state_machine.get_elapsed_time(t)
@@ -1326,9 +1432,10 @@ def run_simulation(
     
     if len(zmp_violations) > 0:
         n_violations = sum(1 for v in zmp_violations if v > 0.001)
-        compliance_rate = 100.0 * (1 - n_violations / len(zmp_violations))
+        compliance_rate = 1.0 - n_violations / len(zmp_violations)
+        compliance_rate_pct = 100.0 * compliance_rate
         max_violation = max(zmp_violations) if zmp_violations else 0.0
-        print(f"ZMP Constraint Compliance: {compliance_rate:.1f}%")
+        print(f"ZMP Constraint Compliance: {compliance_rate_pct:.1f}%")
         print(f"ZMP Violations: {n_violations}/{len(zmp_violations)} samples")
         print(f"Max ZMP Violation: {max_violation:.4f}m")
         
@@ -1350,6 +1457,43 @@ def run_simulation(
     if dataset_collector is not None and rl_config is not None and rl_config.dataset_path is not None:
         dataset_collector.save(rl_config.dataset_path)
         print(f"Saved behavior cloning dataset to {rl_config.dataset_path}")
+
+    if record_path is not None:
+        sim.stop_recording()
+
+    if log_path is not None:
+        log_file = Path(log_path)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        meta = {
+            "config": config.__dict__,
+            "dt": config.dt,
+            "notes": "Time-series log for plotting ATP tests",
+        }
+
+        np.savez_compressed(
+            log_file,
+            meta_json=np.array([json.dumps(meta)]),
+            t=np.asarray(log_t, dtype=float),
+            state=np.asarray(log_state, dtype=int),
+            step_idx=np.asarray(log_step_idx, dtype=int),
+            com=np.asarray(log_com, dtype=float),
+            com_vel=np.asarray(log_com_vel, dtype=float),
+            zmp=np.asarray(log_zmp, dtype=float),
+            zmp_bounds=np.asarray(log_zmp_bounds, dtype=float),
+            zmp_violation=np.asarray(log_zmp_violation, dtype=float),
+            dcm=np.asarray(log_dcm, dtype=float),
+            dcm_ref=np.asarray(log_dcm_ref, dtype=float),
+            dcm_err=np.asarray(log_dcm_err, dtype=float),
+            solve_ms=np.asarray(log_solve_ms, dtype=float),
+            v_ref=np.asarray(log_v_ref, dtype=float),
+            stride=np.asarray(log_stride, dtype=float),
+            t_ss=np.asarray(log_t_ss, dtype=float),
+            t_ds=np.asarray(log_t_ds, dtype=float),
+            margin=np.asarray(log_margin, dtype=float),
+            push=np.asarray(log_push, dtype=float),
+            control_mode=np.asarray(log_control_mode, dtype=str),
+        )
 
     sim.close()
 
@@ -1440,16 +1584,30 @@ def validate_mpc(
     return passed
 
 
-def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
+def run_atp_tests(
+    base_config: SimulationConfig,
+    gui: bool = False,
+    output_dir: Optional[Path] = None,
+    make_plots: bool = True,
+):
     print("\nRunning ATP test suite...")
     print("=" * 60)
 
-    results = {}
+    run_dir = output_dir if output_dir is not None else (Path("v2") / "results" / "atp" / time.strftime("%Y%m%d_%H%M%S"))
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    results = {"output_dir": str(run_dir)}
 
     # Test 1: Steady-State Walking (approx 10m)
     required_steps = int(np.ceil(10.0 / base_config.stride_length)) + 2
     config_t1 = SimulationConfig(**{**base_config.__dict__, "n_steps": required_steps})
-    metrics_t1 = run_simulation(config_t1, gui=gui, print_every=200, return_metrics=True)
+    metrics_t1 = run_simulation(
+        config_t1,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_1_steady_state.npz"),
+    )
     results["steady_state"] = {
         "distance_m": metrics_t1.distance_m,
         "fell": metrics_t1.fell,
@@ -1457,7 +1615,13 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
 
     # Test 2: ZMP Boundary Test
     config_t2 = SimulationConfig(**base_config.__dict__)
-    metrics_t2 = run_simulation(config_t2, gui=gui, print_every=200, return_metrics=True)
+    metrics_t2 = run_simulation(
+        config_t2,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_2_zmp_boundary.npz"),
+    )
     results["zmp_boundary"] = {
         "compliance": metrics_t2.zmp_compliance,
         "max_violation": metrics_t2.max_zmp_violation,
@@ -1465,7 +1629,13 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
 
     # Test 3: External Perturbation
     config_t3 = SimulationConfig(**{**base_config.__dict__, "disturbance_force": 40.0})
-    metrics_t3 = run_simulation(config_t3, gui=gui, print_every=200, return_metrics=True)
+    metrics_t3 = run_simulation(
+        config_t3,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_3_disturbance_40N.npz"),
+    )
     results["disturbance"] = {
         "fell": metrics_t3.fell,
         "force": 40.0,
@@ -1473,7 +1643,13 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
 
     # Test 4: Velocity Tracking
     config_t4 = SimulationConfig(**{**base_config.__dict__, "t_ss": 1.1, "t_ds": 1.6})
-    metrics_t4 = run_simulation(config_t4, gui=gui, print_every=200, return_metrics=True)
+    metrics_t4 = run_simulation(
+        config_t4,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_4_velocity_tracking.npz"),
+    )
     results["velocity_tracking"] = {
         "forward_vel_mae": metrics_t4.forward_vel_mae_mps,
         "avg_forward_vel": metrics_t4.avg_forward_vel_mps,
@@ -1481,7 +1657,13 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
 
     # Test 6: Stop-and-Go
     config_t6 = SimulationConfig(**{**base_config.__dict__, "t_end": 3.0})
-    metrics_t6 = run_simulation(config_t6, gui=gui, print_every=200, return_metrics=True)
+    metrics_t6 = run_simulation(
+        config_t6,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_6_stop_and_go.npz"),
+    )
     results["stop_and_go"] = {
         "final_com_vel": metrics_t6.final_com_vel,
         "fell": metrics_t6.fell,
@@ -1490,8 +1672,20 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
     # Test 5: Energy Efficiency
     config_t5_mpc = SimulationConfig(**{**base_config.__dict__, "track_energy": True})
     config_t5_baseline = SimulationConfig(**{**base_config.__dict__, "track_energy": True, "use_mpc": False})
-    metrics_t5_mpc = run_simulation(config_t5_mpc, gui=gui, print_every=200, return_metrics=True)
-    metrics_t5_baseline = run_simulation(config_t5_baseline, gui=gui, print_every=200, return_metrics=True)
+    metrics_t5_mpc = run_simulation(
+        config_t5_mpc,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_5_energy_efficiency_mpc.npz"),
+    )
+    metrics_t5_baseline = run_simulation(
+        config_t5_baseline,
+        gui=gui,
+        print_every=200,
+        return_metrics=True,
+        log_path=str(run_dir / "test_5_energy_efficiency_baseline.npz"),
+    )
 
     if metrics_t5_baseline.cot > 0.0:
         cot_reduction = (metrics_t5_baseline.cot - metrics_t5_mpc.cot) / metrics_t5_baseline.cot
@@ -1517,6 +1711,16 @@ def run_atp_tests(base_config: SimulationConfig, gui: bool = False):
         f"Baseline={results['energy_efficiency']['cot_baseline']:.4f}, "
         f"Reduction={results['energy_efficiency']['cot_reduction'] * 100:.1f}%"
     )
+    print(f"\nSaved ATP logs to: {run_dir}")
+
+    if make_plots:
+        try:
+            from v2.plot_atp import plot_directory
+
+            plot_directory(run_dir)
+            print(f"Saved ATP plots to: {run_dir / 'plots'}")
+        except Exception as e:
+            print(f"WARNING: Failed to generate plots: {e}")
     print("=" * 60)
 
 
@@ -1524,15 +1728,27 @@ def main():
     parser = argparse.ArgumentParser(description="MPC Walking Controller Simulation")
     parser.add_argument("--no-gui", action="store_true", help="Run without GUI")
     parser.add_argument("--n-steps", type=int, default=10, help="Number of walking steps")
-    parser.add_argument("--stride", type=float, default=0.12, help="Stride length in meters")
+    parser.add_argument("--stride", type=float, default=SimulationConfig().stride_length, help="Stride length in meters")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum simulation steps")
     parser.add_argument("--print-every", type=int, default=50, help="Print status every N steps")
+    parser.add_argument("--record", type=str, default=None, help="Record an MP4 using PyBullet state logging")
     parser.add_argument("--disturbance", type=float, default=0.0, 
                         help="Apply lateral disturbance force (N) during single support")
     parser.add_argument("--disturbance-time", type=float, default=5.0,
                         help="Time (s) to apply disturbance")
     parser.add_argument("--validate-mpc", action="store_true", help="Run MPC validation and exit")
     parser.add_argument("--run-atp", action="store_true", help="Run ATP test suite and exit")
+    parser.add_argument(
+        "--atp-out",
+        type=str,
+        default=None,
+        help="Override output directory for ATP logs/plots (default: v2/results/atp/<timestamp>)",
+    )
+    parser.add_argument(
+        "--no-atp-plots",
+        action="store_true",
+        help="Skip ATP plot generation",
+    )
     parser.add_argument("--collect-bc", type=str, default=None, help="Path to save MPC rollout dataset (.npz)")
     parser.add_argument("--train-bc", type=str, default=None, help="Path to dataset (.npz) for training a linear policy")
     parser.add_argument("--bc-output", type=str, default="v2/rl/linear_policy.npz", help="Output path for trained policy")
@@ -1562,6 +1778,7 @@ def main():
     parser.add_argument("--residual-clip", type=float, default=0.03, help="Residual ZMP clip (m)")
     parser.add_argument("--weight-update-steps", type=int, default=20, help="Steps between MPC weight updates")
     parser.add_argument("--gait-update-steps", type=int, default=10, help="Steps between gait parameter updates")
+    parser.add_argument("--eval", action="store_true", help="Print one-line metrics summary instead of full output")
     args = parser.parse_args()
     
     config = SimulationConfig(
@@ -1598,7 +1815,12 @@ def main():
         return
 
     if args.run_atp:
-        run_atp_tests(config, gui=not args.no_gui)
+        run_atp_tests(
+            config,
+            gui=not args.no_gui,
+            output_dir=Path(args.atp_out) if args.atp_out is not None else None,
+            make_plots=not args.no_atp_plots,
+        )
         return
 
     rl_config = None
@@ -1612,12 +1834,38 @@ def main():
             gait_update_steps=args.gait_update_steps,
         )
 
+    if args.eval:
+        import io
+        from contextlib import redirect_stdout
+
+        with redirect_stdout(io.StringIO()):
+            metrics = run_simulation(
+                config,
+                gui=not args.no_gui,
+                max_steps=args.max_steps,
+                print_every=args.print_every,
+                rl_config=rl_config,
+                return_metrics=True,
+                record_path=args.record,
+            )
+        if metrics is not None:
+            print(
+                "EVAL | "
+                f"dist={metrics.distance_m:.3f}m | "
+                f"speed={metrics.avg_speed_mps:.3f}m/s | "
+                f"compliance={100.0 * metrics.zmp_compliance:.1f}% | "
+                f"dcm_err={metrics.avg_dcm_error:.4f}m | "
+                f"fell={metrics.fell}"
+            )
+        return
+
     run_simulation(
         config,
         gui=not args.no_gui,
         max_steps=args.max_steps,
         print_every=args.print_every,
         rl_config=rl_config,
+        record_path=args.record,
     )
 
 
