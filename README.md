@@ -1,6 +1,6 @@
 # Constraint-Aware Model Predictive Control & Reinforcement Learning for Bipedal Locomotion
 
-![RL Walk](assets/rl_walk.gif)
+![Baseline MPC Walk](assets/baseline_walk.gif)
 
 ## Overview
 This project implements a robust control framework for the **Talos Humanoid Robot** using a hierarchical architecture:
