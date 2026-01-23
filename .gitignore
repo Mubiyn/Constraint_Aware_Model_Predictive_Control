@@ -19,6 +19,8 @@ coverage.xml
 results/
 talos_data/
 archive/
+report_tex/
+archive/
 *.log
 *.mp4
 *.npz
