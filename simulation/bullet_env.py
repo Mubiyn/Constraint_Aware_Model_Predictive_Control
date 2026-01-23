@@ -10,7 +10,68 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pybullet as pb
 import pybullet_data
+import subprocess
+import shutil
 
+class FFMPEGRecorder:
+    """Headless video recorder using ffmpeg pipe."""
+    def __init__(self, filename: str, width: int = 1280, height: int = 720, fps: int = 30):
+        self.cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'rgba',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-crf', '20',
+            '-loglevel', 'error',
+            filename
+        ]
+        self.process = subprocess.Popen(self.cmd, stdin=subprocess.PIPE)
+        self.width = width
+        self.height = height
+        self.step_counter = 0
+        self.fps = fps
+        
+    def capture(self, sim_dt: float, base_pos=None):
+        """Capture frame if enough time has passed."""
+        # Calculate steps per frame: (1/SimDT) / FPS
+        steps_per_frame = int((1.0 / sim_dt) / self.fps)
+        self.step_counter += 1
+        
+        if self.step_counter >= steps_per_frame:
+            self.step_counter = 0
+            
+            view_matrix = pb.computeViewMatrixFromYawPitchRoll(
+                cameraTargetPosition=base_pos if base_pos is not None else [0, 0, 0.9],
+                distance=2.5,
+                yaw=45,
+                pitch=-20,
+                roll=0,
+                upAxisIndex=2
+            )
+            proj_matrix = pb.computeProjectionMatrixFOV(
+                fov=60, aspect=float(self.width)/self.height,
+                nearVal=0.1, farVal=100.0
+            )
+            
+            w, h, rgba, _, _ = pb.getCameraImage(
+                width=self.width, height=self.height,
+                viewMatrix=view_matrix,
+                projectionMatrix=proj_matrix,
+                renderer=pb.ER_TINY_RENDERER
+            )
+            
+            self.process.stdin.write(rgba)
+
+    def close(self):
+        if self.process:
+            self.process.stdin.close()
+            self.process.wait()
+            self.process = None
 
 def _build_joint_maps(robot_id: int, model) -> Tuple[Dict[int, int], Dict[int, int]]:
     """Build mappings between PyBullet and Pinocchio joint indices.
@@ -123,6 +184,8 @@ class BulletSimulator:
         self.lf_link_id = _link_index(self.robot_id, model.get_lf_link_name())
         
         self.log_id = None
+        self.recorder = None
+        self.gui = gui
         
     @property
     def pb(self):
@@ -132,6 +195,12 @@ class BulletSimulator:
     def step(self):
         """Advance simulation by one time step."""
         pb.stepSimulation()
+        if self.recorder:
+            try:
+                pos, _ = pb.getBasePositionAndOrientation(self.robot_id)
+                self.recorder.capture(self.dt, pos)
+            except Exception:
+                pass  # Ignore capture errors during teardown
         
     def reset_configuration(self, q: np.ndarray):
         """Set robot configuration from Pinocchio q vector.
@@ -367,13 +436,22 @@ class BulletSimulator:
         
     def start_recording(self, filename: str = "recording.mp4"):
         """Start video recording."""
-        self.log_id = pb.startStateLogging(pb.STATE_LOGGING_VIDEO_MP4, filename)
+        if self.gui:
+            self.log_id = pb.startStateLogging(pb.STATE_LOGGING_VIDEO_MP4, filename)
+        else:
+            if shutil.which("ffmpeg") is None:
+                print("Warning: ffmpeg not found, cannot record video in headless mode.")
+                return
+            self.recorder = FFMPEGRecorder(filename)
         
     def stop_recording(self):
         """Stop video recording."""
         if self.log_id is not None:
             pb.stopStateLogging(self.log_id)
             self.log_id = None
+        if self.recorder is not None:
+            self.recorder.close()
+            self.recorder = None
             
     def close(self):
         """Disconnect from PyBullet."""

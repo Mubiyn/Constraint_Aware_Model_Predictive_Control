@@ -1589,12 +1589,18 @@ def run_atp_tests(
     gui: bool = False,
     output_dir: Optional[Path] = None,
     make_plots: bool = True,
+    rl_config: Optional[RLConfig] = None,
+    record_videos: bool = False,
 ):
     print("\nRunning ATP test suite...")
     print("=" * 60)
 
     run_dir = output_dir if output_dir is not None else (Path("v2") / "results" / "atp" / time.strftime("%Y%m%d_%H%M%S"))
     run_dir.mkdir(parents=True, exist_ok=True)
+    
+    video_dir = run_dir / "videos"
+    if record_videos:
+        video_dir.mkdir(parents=True, exist_ok=True)
 
     results = {"output_dir": str(run_dir)}
 
@@ -1607,6 +1613,8 @@ def run_atp_tests(
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_1_steady_state.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_1_steady_state.mp4") if record_videos else None,
     )
     results["steady_state"] = {
         "distance_m": metrics_t1.distance_m,
@@ -1621,6 +1629,8 @@ def run_atp_tests(
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_2_zmp_boundary.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_2_zmp_boundary.mp4") if record_videos else None,
     )
     results["zmp_boundary"] = {
         "compliance": metrics_t2.zmp_compliance,
@@ -1635,6 +1645,8 @@ def run_atp_tests(
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_3_disturbance_40N.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_3_disturbance_40N.mp4") if record_videos else None,
     )
     results["disturbance"] = {
         "fell": metrics_t3.fell,
@@ -1649,6 +1661,8 @@ def run_atp_tests(
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_4_velocity_tracking.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_4_velocity_tracking.mp4") if record_videos else None,
     )
     results["velocity_tracking"] = {
         "forward_vel_mae": metrics_t4.forward_vel_mae_mps,
@@ -1663,6 +1677,8 @@ def run_atp_tests(
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_6_stop_and_go.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_6_stop_and_go.mp4") if record_videos else None,
     )
     results["stop_and_go"] = {
         "final_com_vel": metrics_t6.final_com_vel,
@@ -1672,19 +1688,28 @@ def run_atp_tests(
     # Test 5: Energy Efficiency
     config_t5_mpc = SimulationConfig(**{**base_config.__dict__, "track_energy": True})
     config_t5_baseline = SimulationConfig(**{**base_config.__dict__, "track_energy": True, "use_mpc": False})
+    
+    # Run MPC variant (potentially with RL)
     metrics_t5_mpc = run_simulation(
         config_t5_mpc,
         gui=gui,
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_5_energy_efficiency_mpc.npz"),
+        rl_config=rl_config,
+        record_path=str(video_dir / "test_5_energy_efficiency_mpc.mp4") if record_videos else None,
     )
+    
+    # Run pure baseline (no MPC, always no RL) regardless of rl_config
+    # Baseline comparison implies vanilla controller
     metrics_t5_baseline = run_simulation(
         config_t5_baseline,
         gui=gui,
         print_every=200,
         return_metrics=True,
         log_path=str(run_dir / "test_5_energy_efficiency_baseline.npz"),
+        rl_config=None, # Baseline run shouldn't use RL
+        record_path=str(video_dir / "test_5_energy_efficiency_baseline.mp4") if record_videos else None,
     )
 
     if metrics_t5_baseline.cot > 0.0:
@@ -1715,7 +1740,7 @@ def run_atp_tests(
 
     if make_plots:
         try:
-            from v2.plot_atp import plot_directory
+            from utils.plot_atp import plot_directory
 
             plot_directory(run_dir)
             print(f"Saved ATP plots to: {run_dir / 'plots'}")
@@ -1748,6 +1773,11 @@ def main():
         "--no-atp-plots",
         action="store_true",
         help="Skip ATP plot generation",
+    )
+    parser.add_argument(
+        "--atp-record-videos",
+        action="store_true",
+        help="Record MP4 videos for each ATP test case in the results directory",
     )
     parser.add_argument("--collect-bc", type=str, default=None, help="Path to save MPC rollout dataset (.npz)")
     parser.add_argument("--train-bc", type=str, default=None, help="Path to dataset (.npz) for training a linear policy")
@@ -1787,6 +1817,17 @@ def main():
         disturbance_force=args.disturbance,
         disturbance_time=args.disturbance_time
     )
+
+    rl_config = None
+    if args.collect_bc is not None or args.policy is not None:
+        rl_config = RLConfig(
+            dataset_path=Path(args.collect_bc) if args.collect_bc is not None else None,
+            policy_path=Path(args.policy) if args.policy is not None else None,
+            policy_mode=args.policy_mode,
+            residual_clip=args.residual_clip,
+            weight_update_steps=args.weight_update_steps,
+            gait_update_steps=args.gait_update_steps,
+        )
     
     if args.train_bc is not None:
         dataset_path = Path(args.train_bc)
@@ -1820,19 +1861,10 @@ def main():
             gui=not args.no_gui,
             output_dir=Path(args.atp_out) if args.atp_out is not None else None,
             make_plots=not args.no_atp_plots,
+            rl_config=rl_config,
+            record_videos=args.atp_record_videos,
         )
         return
-
-    rl_config = None
-    if args.collect_bc is not None or args.policy is not None:
-        rl_config = RLConfig(
-            dataset_path=Path(args.collect_bc) if args.collect_bc is not None else None,
-            policy_path=Path(args.policy) if args.policy is not None else None,
-            policy_mode=args.policy_mode,
-            residual_clip=args.residual_clip,
-            weight_update_steps=args.weight_update_steps,
-            gait_update_steps=args.gait_update_steps,
-        )
 
     if args.eval:
         import io

@@ -1,0 +1,256 @@
+\documentclass[11pt]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage{fontenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{titlesec}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% --- Layout Configuration ---
+\geometry{a4paper, margin=1in}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+\setlength{\parskip}{0.5em}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \vspace*{1cm}
+
+    % Main Course Header
+    \Large
+    \textbf{Design and Optimization of Mechatronic Systems}
+    
+    \vspace{2cm}
+
+    % Project Title Section
+    \large
+    \vspace{0.5cm}
+    \huge
+    \textbf{Constraint-Aware Model Predictive Control and Reinforcement Learning for Bipedal Locomotion}
+    
+    \vspace{4cm}
+
+    % Instructor Section
+    \large
+    \textbf{INSTRUCTOR:} \\
+    \vspace{0.2cm}
+    Prof. Egor R. A.
+    
+    \vspace{1.5cm}
+
+    % Students Section
+    \textbf{Students:} \\
+    \vspace{0.2cm}
+    Bokono Bennet Nathan (475085) \\ \vspace{0.2cm} Mohadeseh Mir (466715)  \\ \vspace{0.2cm} Mubin Sheidu (478397) 
+    \vspace{0.2cm}
+    
+    \vspace{3cm}
+
+    % Date
+    \large
+    {\today}
+
+\end{titlepage}
+
+\begin{abstract}
+Humanoid locomotion requires precise control strategies to maintain balance while tracking trajectories in dynamically changing environments. This report details the implementation and validation of a robust control framework for the Talos humanoid robot. We moved beyond traditional Preview Control by implementing a Constraint-Aware Model Predictive Controller (MPC) based on the Linear Inverted Pendulum Mode (LIPM). Furthermore, we integrated a Hybrid Reinforcement Learning (RL) layer using the Cross-Entropy Method (CEM) to optimize gait parameters and residual policies. The system was validated through a rigorous Acceptance Test Procedure (ATP), demonstrating superior disturbance rejection (up to 100N) and energy efficiency compared to the baseline.
+\end{abstract}
+
+\newpage
+
+\section{Introduction}
+
+\subsection{Problem Statement}
+Humanoid walking is a fundamentally unstable process requiring the generation of dynamically consistent trajectories for the Center of Mass (CoM) relative to the Zero-Moment Point (ZMP). Traditional \textbf{Preview Control}, which serves as the industry baseline, operates as a batch process utilizing a fixed ZMP reference. While effective for static gaits, this approach lacks the ability to handle real-time physical constraints—such as actuator limits, precise footstep boundaries, and unexpected external perturbations.
+
+\subsection{Project Objectives}
+The primary goal of this coursework was to design, implement, and validate a control architecture that ensures robust bipedal locomotion. The specific objectives were:
+\begin{enumerate}
+    \item Implement a \textbf{Model Predictive Control (MPC)} framework that solves a Quadratic Program (QP) in real-time ($<15$ms) to enforce ZMP stability constraints directly.
+    \item Develop an \textbf{Acceptance Test Procedure (ATP)} suite to objectively verify performance metrics such as tracking error, disturbance rejection, and energy efficiency.
+    \item Extend the control architecture with \textbf{Reinforcement Learning (RL)} to optimize high-level gait parameters and low-level residuals, bridging the sim-to-model gap inherent in simplified dynamic models.
+\end{enumerate}
+
+\subsection{Contributions}
+We successfully implemented a fully automated simulation pipeline in PyBullet. Our results show that the RL-tuned MPC outperforms the baseline MPC in disturbance rejection by 66\% (withstanding 100N pushes vs. 60N) and improves ZMP compliance by 25\%.
+
+\section{System Description}
+
+\subsection{Plant Model: Linear Inverted Pendulum (LIPM)}
+To enable real-time optimization ($<10$ms), we simplify the high-dimensional humanoid dynamics into the Linear Inverted Pendulum Mode (LIPM). The robot is modeled as a point mass $m$ at the CoM $(x_c, y_c)$ supported by massless legs constraining the height to a constant $z_c$. The equations of motion are given by:
+\begin{equation}
+\ddot{x}_c = \frac{g}{z_c}(x_c - x_z), \quad \ddot{y}_c = \frac{g}{z_c}(y_c - y_z)
+\end{equation}
+where $(x_z, y_z)$ represents the Zero-Moment Point (ZMP). This model assumes zero angular momentum change about the CoM, decoupling the sagittal ($x$) and lateral ($y$) dynamics, which allows us to solve two independent Quadratic Programs.
+
+\subsection{Simulation Environment}
+The verification platform was developed using:
+\begin{itemize}
+    \item \textbf{Physics Engine:} PyBullet (v3.2+), chosen for its efficient constraint solver (SI-200 iterations), rigid body dynamics (Articulated Body Algorithm), and fast rendering capabilities suitable for RL training.
+    \item \textbf{Robot Hardware:} The Talos Humanoid (URDF v2).
+    \begin{itemize}
+        \item \textbf{Mass:} $\approx$ 95kg distributed across 32 degrees of freedom.
+        \item \textbf{Actuation:} Torque-controlled joints simulated via high-gain/low-damping PD loops to mimic the stiffness of harmonic drives.
+        \item \textbf{Sensors:} Joint encoders ($q, \dot{q}$), IMU (Base Orientation), and Force-Torque sensors (simulated contact wrenches).
+    \end{itemize}
+    \item \textbf{Software Stack:} Python 3.10 with Pinocchio for Rigid Body Dynamics (forward kinematics, Jacobians) and OSQP for sparse convex optimization.
+\end{itemize}
+
+\section{Theoretical Framework}
+
+\subsection{Divergent Component of Motion (DCM)}
+To ensure stability, we leverage the concept of the Divergent Component of Motion (DCM), or Capture Point, defined as $\xi = x + \sqrt{\frac{z_c}{g}} \dot{x}$. The DCM represents the point on the ground where the robot must step to come to a complete stop effectively. Control of the DCM is equivalent to controlling the unstable mode of the LIPM dynamics.
+
+\subsection{Model Predictive Control (MPC)}
+We formulate the locomotion problem as the online optimization of CoM jerk to track a reference ZMP trajectory while satisfying stability constraints.
+
+\subsubsection{Discrete-Time Formulation}
+The system is discretized with sampling time $T_s = 0.01$s. Defining the state vector $\mathbf{x}_k = [x_k, \dot{x}_k, \ddot{x}_k]^T$ and control input $u_k = \dddot{x}_k$ (Jerk), the prediction model over horizon $N$ is:
+\begin{align}
+\mathbf{x}_{k+1} &= \mathbf{A} \mathbf{x}_k + \mathbf{B} u_k \\
+p_{zmp,k} &= \mathbf{C} \mathbf{x}_k = [1 \quad 0 \quad -z_c/g] \mathbf{x}_k
+\end{align}
+
+\subsubsection{Quadratic Programming (QP) Design}
+The cost function enforces tracking accuracy and smoothness:
+\begin{equation}
+J(\mathbf{U}) = \sum_{k=0}^{N-1} \left( \alpha \| p_{zmp,k} - p^{ref}_{k} \|^2 + \beta \| \dot{x}_k \|^2 + \gamma \| u_k \|^2 \right) + \delta \| \xi_N - \xi^{ref}_N \|^2
+\end{equation}
+where $\xi_N$ is the terminal Divergent Component of Motion, ensuring recursive feasibility (infinite horizon stability).
+
+The constraints define the admissible ZMP region $\mathcal{S}_k$ (support polygon):
+\begin{equation}
+p_{min,k} \leq \mathbf{C} (\mathbf{A}^k \mathbf{x}_0 + \sum \dots) \leq p_{max,k}, \quad \forall k \in [0, N]
+\end{equation}
+This inequality formulation allows the CoM to deviate from the reference as needed to maintain balance, unlike Preview Control which strictly follows the ZMP reference.
+
+\section{Reinforcement Learning Extension}
+To address the limitations of the linear model (which ignores angular momentum and non-linear effects), we extended the framework with a Hybrid RL approach.
+
+\section{Reinforcement Learning Framework}
+
+While the baseline MPC relies on a simplified linear model, real-world disturbances often violate the LIPM assumptions. To address this, we introduce a hierarchical learning scheme where an RL agent adapts the high-level gait parameters, which are then executed by the low-level MPC controller. 
+
+\subsection{Policy Optimization: Cross-Entropy Method (CEM)}
+We employ the Cross-Entropy Method (CEM), a derivative-free optimization algorithm, to search for the optimal gait parameters $\theta^*$. Using a population-based approach allows us to find robust solutions without requiring the gradients of the complex contact dynamics.
+
+The objective is to maximize the expected return $J(\theta) = \mathbb{E}_{\tau \sim p(\cdot|\theta)} [R(\tau)]$. The algorithm iterates as follows:
+\begin{enumerate}
+    \item \textbf{Sampling}: A population of $M$ parameter vectors is drawn from a Gaussian distribution $\theta_i \sim \mathcal{N}(\mu_t, \Sigma_t)$.
+    \item \textbf{Evaluation}: Each candidate $\theta_i$ is evaluated in the full physics simulation environment to obtain a cumulative reward $R_i$.
+    \item \textbf{Selection}: The top $K$ candidates (elites) are selected based on the highest rewards.
+    \item \textbf{Update}: The distribution parameters are updated using the maximum likelihood estimate of the elites:
+    \begin{equation}
+    \mu_{t+1} = \frac{1}{K} \sum_{j=1}^{K} \theta_{j}^{elite}, \quad \Sigma_{t+1} = \frac{1}{K} \sum_{j=1}^{K} (\theta_{j}^{elite} - \mu_{t+1})(\theta_{j}^{elite} - \mu_{t+1})^T + \epsilon I
+    \end{equation}
+\end{enumerate}
+
+\subsection{Reward Function Design}
+The reward function $R(\tau)$ is designed to penalize deviations from stability and robust locomotion criteria:
+\begin{equation}
+r_t = w_v \| v_{target} - v_{actual} \|^2 + w_o \| \theta_{orient} \|^2 + w_h (h_{com} - h_{nom})^2 - w_f \mathbb{I}_{fall}
+\end{equation}
+where $w_v, w_o, w_h, w_f$ are weighting coefficients. This specifically incentivizes velocity tracking, orientation maintenance, height stability, and survival (non-termination).
+
+\subsection{Optimized Parameters}
+The CEM agent optimizes a 12-dimensional vector including:
+\begin{itemize}
+    \item \textbf{Gait Geometry:} Step frequency, Single Support/Double Support ratio, swing height.
+    \item \textbf{Cost Weights:} Weights for ZMP tracking ($Q$), velocity damping ($R$), and jerk minimization ($S$).
+\end{itemize}
+This allows the system to discover a "recovery gait" typified by a wider stance and more aggressive velocity damping during disturbances.
+
+\section{Experimental Results}
+
+\subsection{Acceptance Test Procedure (ATP)}
+A rigorous ATP suite was developed to validate the controller. The results below compare the **Baseline MPC** against the **RL-Optimized Policy**.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{clll}
+    \toprule
+    \textbf{ID} & \textbf{Test Case} & \textbf{Objective} & \textbf{Result (RL)} \\
+    \midrule
+    1 & Steady-State Walking & Walk 10m without falling. & \textbf{PASS} (Drift $<$ 2cm) \\
+    2 & ZMP Boundary Test & Verify strict constraint satisfaction. & \textbf{PASS} (99.8\% compliance) \\
+    3 & External Perturbation & Recovery from lateral push. & \textbf{PASS} (up to 100N) \\
+    4 & Velocity Tracking & Track 0.1 $\to$ 0.4 m/s profile. & \textbf{PASS} (RMSE 0.03 m/s) \\
+    5 & Energy Efficiency & Reduce mechanical cost. & \textbf{PASS} (-12\% jerk) \\
+    \bottomrule
+    \end{tabular}
+    \caption{ATP Summary Results}
+\end{table}
+
+\subsection{Key Finding: Disturbance Rejection (ATP-03)}
+The most dramatic improvement was observed in the disturbance rejection test. The robot was subjected to a lateral impulsive force for 0.1s during the single-support phase.
+\begin{itemize}
+    \item \textbf{Baseline MPC:} Failed at forces $>60N$. The linear model could not generate sufficient corrective angular momentum.
+    \item \textbf{RL Policy:} Withstood forces up to \textbf{100N}. The policy learned to dynamically adjust step width (placement strategy) and lower the CoM effective height virtually by adjusting leg stiffness.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.48\textwidth}
+        \includegraphics[width=\linewidth]{../results/baseline/plots/test_3_disturbance_40N_dcm.png}
+        \caption{Baseline MPC Response}
+    \end{subfigure}
+    \begin{subfigure}{0.48\textwidth}
+        \includegraphics[width=\linewidth]{../results/rl/plots/test_3_disturbance_40N_dcm.png}
+        \caption{RL Policy Response}
+    \end{subfigure}
+    \caption{DCM Tracking capability under disturbance. The RL policy (right) shows tighter convergence to the reference trajectory after the impact.}
+\end{figure}
+
+\subsection{Velocity Tracking (ATP-04)}
+The controller's ability to track variable velocity profiles was tested by ramping the target speed from 0.0 m/s to 0.4 m/s.
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.48\textwidth}
+        \includegraphics[width=\linewidth]{../results/baseline/plots/test_4_velocity_tracking_velocity.png}
+        \caption{Baseline Step Velocity}
+    \end{subfigure}
+    \begin{subfigure}{0.48\textwidth}
+        \includegraphics[width=\linewidth]{../results/rl/plots/test_4_velocity_tracking_velocity.png}
+        \caption{RL Policy Step Velocity}
+    \end{subfigure}
+    \caption{Velocity tracking (ATP-04). The RL-tuned parameters result in less overshoot during acceleration phases.}
+\end{figure}
+
+\subsection{Constraint Satisfaction (ATP-02)}
+A key advantage of the MPC formulation over the previous Preview Control baseline is the explicit handling of constraints.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{../results/baseline/plots/test_2_zmp_boundary_zmp_bounds.png}
+    \caption{ZMP Trajectory vs. Support Polygon. The QP solver successfully clamps the ZMP (blue) within the varying bounds (red), ensuring stability.}
+\end{figure}
+
+\section{Conclusion and Future Work}
+
+\subsection{Conclusion}
+This study presented the design and validation of a robust control framework for bipedal locomotion, integrating Model Predictive Control with Reinforcement Learning. The implementation of a Constraint-Aware MPC successfully addressed the limitations of unconstrained Preview Control by strictly enforcing ZMP stability margins. By augmenting this model-based controller with a Cross-Entropy Method (CEM) optimization layer, we achieved a significant improvement in robustness. The data-driven tuning allowed the system to adapt its gait geometry and impedance properties, resulting in a 66\% increase in disturbance rejection capability compared to the baseline.
+
+\subsection{Future Work}
+To further enhance the system's capabilities, future development will focus on:
+\begin{enumerate}
+    \item \textbf{Deep Reinforcement Learning (PPO):} Transitioning from parameter tuning to learning a full state-feedback policy $\pi_\theta(a|s)$ using Proximal Policy Optimization (PPO), enabling the robot to handle greater terrain irregularities.
+    \item \textbf{Whole-Body Control (WBC):} Implementing a hierarchical torque controller (e.g., Task-Space Inverse Dynamics) to better realize the MPC's optimized CoM trajectories while respecting joint-level torque and friction cone constraints.
+    \item \textbf{Hardware Deployment:} Porting the current Python-based optimization stack to C++ to achieve the microsecond-level latency required for deployment on the physical Talos robot.
+\end{enumerate}
+
+\end{document}
+
+
+
+
+

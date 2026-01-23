@@ -1,0 +1,191 @@
+\documentclass[11pt]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage{fontenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{titlesec}
+\usepackage{xcolor}
+
+% --- Layout Configuration ---
+\geometry{a4paper, margin=1in}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    % \vspace*{0.2cm}
+
+    % Main Course Header
+    \Large
+    \textbf{Design and Optimization of Mechatronic Systems}
+    
+    \vspace{2cm}
+
+    % Project Title Section
+    \large
+    \vspace{0.5cm}
+    \huge
+    \textbf{Constraint-Aware Model Predictive Control and Reinforcement Learning for Bipedal Locomotion}
+    
+    \vspace{5cm}
+
+    % Instructor Section
+    \large
+    \textbf{INSTRUCTOR:} \\
+    \vspace{0.2cm}
+    Prof. Egor R. A.
+    
+    \vspace{1.5cm}
+
+    % Students Section
+    \textbf{Students:} \\
+    \vspace{0.2cm}
+    Bokono Bennet Nathan (475085) \\ \vspace{0.2cm} Mohadeseh Mir (466715)  \\ \vspace{0.2cm} Mubin Sheidu (478397) 
+    \vspace{0.2cm}
+    
+   
+
+    \vspace{2cm}
+
+    % Date
+    \large
+    {December 30th, 2025}
+
+\end{titlepage}
+
+
+
+\section{Introduction}
+Humanoid walking is a fundamentally unstable process requiring the generation of dynamically consistent trajectories for the Center of Mass (CoM) relative to the Zero-Moment Point (ZMP). Traditional \textbf{Preview Control} (the current baseline) operates as a batch process that utilizes a fixed ZMP reference to generate CoM trajectories.[1] However, this approach lacks the ability to handle real-time physical constraints—such as actuator limits and footstep boundaries—leading to instability under external perturbations or uneven terrain.
+
+This project implements a \textbf{Model Predictive Control (MPC)} framework to replace the baseline tracker. Unlike Preview Control, the proposed MPC performs iterative numerical optimization during runtime to satisfy multi-objective costs while respecting hard physical constraints. Furthermore, if the MPC phase achieves its primary benchmarks, the project will explore a \textbf{Hybrid DRL--MPC} approach to optimize the control policy against nonlinearities and terrain uncertainties that are difficult to model analytically.
+
+\section{System Description}
+\subsection{Plant Model: Linear Inverted Pendulum (LIPM)}
+The robot is modeled as a concentrated mass at the CoM $(x_c, y_c)$ supported by massless legs at a constant height $z_c$. The dynamics are described by the second-order linear differential equations:
+\begin{equation}
+\ddot{x}_c = \frac{g}{z_c}(x_c - x_z)
+\end{equation}
+\begin{equation}
+\ddot{y}_c = \frac{g}{z_c}(y_c - y_z)
+\end{equation}
+where $(x_z, y_z)$ denotes the ZMP position and $g$ is the gravitational acceleration.
+
+\subsection{Simulation Environment}
+\begin{itemize}
+    \item \textbf{Platform:} PyBullet Physics Engine.
+    \item \textbf{Robot Model:} Talos Humanoid (URDF).
+    \item \textbf{Control Frequency:} 100--200 Hz (Optimization cycles of 10--15 ms).
+    \item \textbf{Language:} Python 3.10+ (using OSQP or CVXPY solvers).
+\end{itemize}
+
+\section{Theoretical Basis}
+\subsection{Baseline: ZMP Preview Control}
+The baseline minimizes a quadratic cost function over a finite horizon [1]:
+\begin{equation}
+J = \sum_{k=0}^{N} (Q_e e_k^2 + x_k^T Q_x x_k + R \Delta u_k^2)
+\end{equation}
+where $e_k$ is the ZMP tracking error and $\Delta u_k$ is the control input (CoM Jerk). This yields a feedback + integral + preview law that follows a predefined footstep sequence.[1]
+
+\subsection{Optimization: Model Predictive Control (MPC)}
+The proposed solution reformulates the problem as a \textbf{Quadratic Program (QP)} solved at each time step. The discrete-time state-space model for CoM jerk $u$ is formulated as:
+\begin{align}
+\hat{x}_{k+1} &= A \hat{x}_k + B u_k \\
+p_{x,k} &= C \hat{x}_k
+\end{align}
+With sampling time $T$, the matrices are defined as:
+\begin{equation}
+A = \begin{bmatrix} 1 & T & T^2/2 \\ 0 & 1 & T \\ 0 & 0 & 1 \end{bmatrix}, \quad B = \begin{bmatrix} T^3/6 \\ T^2/2 \\ T \end{bmatrix}, \quad C = \begin{bmatrix} 1 & 0 & -z_c/g \end{bmatrix}
+\end{equation}
+
+\subsection{Constraints and Reward Shaping}
+The MPC explicitly enforces the \textbf{Balance Criterion}:
+\begin{equation}
+p_{x,min} \leq p_{x,k} \leq p_{x,max}
+\end{equation}
+where $p_{x,min}$ and $p_{x,max}$ define the support polygon. The cost function is optimized to reduce \textbf{CoM velocity fluctuations}, improving stability at higher walking speeds.
+
+\section{Test Environment Parameters}
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+CoM Height ($z_c$) & 0.8 meters \\
+Sampling Time ($T$) & 0.005 - 0.01 seconds \\
+Prediction Horizon ($N$) & 1.6 seconds (approx. 2 steps) \\
+Gravity ($g$) & 9.81 $m/s^2$ \\
+Solver & OSQP (sparse QP solver) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Test Objectives}
+The ATP verifies that the controller:
+\begin{enumerate}
+    \item \textbf{Ensures Stability:} Maintains the ZMP within the support polygon at all times.
+    \item \textbf{Reduces Energy Consumption:} Minimizes CoM jerk and velocity fluctuations.
+    \item \textbf{Enhances Robustness:} Successfully rejects external lateral and sagittal disturbances.
+    \item \textbf{Improves Motion Quality:} Eliminates discontinuity in CoM acceleration.
+\end{enumerate}
+
+\section{Acceptance Metrics}
+\begin{itemize}
+    \item \textbf{ZMP Deviation:} RMS error between actual ZMP and center of support foot.
+    \item \textbf{Success Rate:} Percentage of walking cycles completed without falling.
+    \item \textbf{Cost of Transport (CoT):} Calculated as $C_{et} = \frac{Energy}{Weight \times Distance}$.
+    \item \textbf{Disturbance Threshold:} Max impulsive force ($N$) robot withstands without balance loss.
+    \item \textbf{Computation Time:} Mean time per optimization cycle (must be $< 15$ ms).
+\end{itemize}
+
+\section{Test Cases}
+\begin{center}
+\small
+\begin{tabular}{clll}
+\toprule
+\textbf{ID} & \textbf{Test Case} & \textbf{Objective} & \textbf{Acceptance Criteria} \\
+\midrule
+1 & Steady-State Walking & Verify basic locomotion. & Successful 10m walk without falling. \\
+2 & ZMP Boundary Test & Verify constraints. & ZMP never exits support polygon. \\
+3 & External Perturbation & Test robustness. & Recovery from torso push $\geq 40N$ for 0.1s. \\
+4 & Velocity Tracking & Tracking accuracy. & MAE of forward base velocity $\leq 0.02$ m/s. \\
+5 & Energy Efficiency & Compare to baseline. & $\geq 15\%$ reduction in mechanical CoT. \\
+6 & Stop-and-Go & Terminal constraints. & Success transition to full stop at final foothold. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Advanced Optimization Extension: Reinforcement Learning}
+If MPC satisfies all test cases, the project will extend into \textbf{Residual Reinforcement Learning}.
+
+\subsection{Hybrid Structure}
+The control input will be augmented by a learned residual:
+\begin{equation}
+u(t) = u_{mpc}(t) + u_{rl}(t)
+\end{equation}
+The RL policy will be trained using \textbf{Proximal Policy Optimization (PPO)} in PyBullet.
+
+\subsection{Learning Objectives}
+\begin{itemize}
+    \item \textbf{Adaptive Weight Tuning:} RL learns to dynamically adjust $Q$ and $R$ matrices.
+    \item \textbf{Nonlinear Compensation:} Accounts for rotational dynamics neglected in LIPM.
+\end{itemize}
+
+\section{Test Outputs}
+\begin{itemize}
+    \item \textbf{Time-Series Logs:} CSV files with CoM/ZMP trajectories and solver status.[2, 3]
+    \item \textbf{Stability Plots:} Overlay of ZMP position vs. foot support polygons.
+    \item \textbf{Visual Validation:} Video recording of PyBullet simulation rollouts.[4, 2]
+\end{itemize}
+
+\section{Conclusion}
+This ATP provides a rigorous framework for validating an advanced MPC controller. By focusing on numerical optimization and hard physical constraints, with a potential extension into Reinforcement Learning for adaptive robustness, this research ensures a measurable improvement in the stability and efficiency of humanoid locomotion.
+
+\end{document}

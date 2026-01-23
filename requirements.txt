@@ -1,0 +1,7 @@
+numpy
+matplotlib
+scipy
+osqp
+pybullet
+pinocchio
+imageio  # for simple gif saving if needed in python, though we used ffmpeg

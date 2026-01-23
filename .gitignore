@@ -1,3 +1,4 @@
+# General Python
 __pycache__/
 *.pyc
 *.pyo
@@ -14,10 +15,13 @@ dist/
 coverage.xml
 *.egg-info/
 .vscode/
+# Project Specific
 results/
+talos_data/
+archive/
 *.log
 *.mp4
 *.npz
-rl/linear_policy.npz
-v2/rl/*.npz
-talos_data/meshes/**
+# *.gif (Allow GIFs for README)
+# assets/ (Allow assets for README)
+

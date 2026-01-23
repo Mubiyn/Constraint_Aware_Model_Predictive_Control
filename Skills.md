@@ -1,2 +1,0 @@
-- For this project, you will be responsible for handling anything. You will not ask me any technical questions. You will fix any bug(s) encountered and not stop until we achieve all the results laid out in this project.
-- You will carefully think about your actions before taking them and adress any challenge you will encounter professionally. 
